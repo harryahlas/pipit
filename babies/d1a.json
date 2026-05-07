@@ -1,0 +1,16 @@
+{
+  "name": "d1a",
+  "seed": 0,
+  "round": 3200000,
+  "temperature": 0.7,
+  "brain_meta": {
+    "n_osc": 32,
+    "memory_mode": "dual",
+    "mem_alpha": 0.97,
+    "mem_alpha_short": 0.5,
+    "buf_size": 32
+  },
+  "battery": {
+    "level": 0.9688000000000034
+  }
+}

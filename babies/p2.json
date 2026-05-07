@@ -1,0 +1,12 @@
+{
+  "name": "p2",
+  "seed": 0,
+  "round": 128000000,
+  "temperature": 0.7,
+  "brain_meta": {
+    "n_osc": 16
+  },
+  "battery": {
+    "level": 0.9688000000000034
+  }
+}

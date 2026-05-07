@@ -17,41 +17,29 @@ Architecture:
       sensory state — N angles rotating at different speeds, nudged by
       what it hears.
 
-  2. Phase memory (Hebbian learning):
-      For each oscillator i and each vocab item v, an exponential
-      moving average of cos(φ_i) and sin(φ_i) at the moment v arrives.
-      This captures:
-        μ_i[v] : the mean phase of osc i when v arrives (circular mean)
-        R_i[v] : the concentration (0 = no pattern, 1 = perfect lock)
+  2. Phase memory — two modes:
 
-      Prediction: score each vocab item by von-Mises similarity
-      between current phases and the mean phases associated with that
-      item. An entrained oscillator at its "preferred phase" gives a
-      strong vote. A non-entrained oscillator contributes noise.
+      'ema' (exponential moving average):
+          For each oscillator i and each vocab item v, an EMA of
+          cos(φ_i) and sin(φ_i) at the moment v arrives. Controlled
+          by mem_alpha (0 = instant, 1 = infinite memory).
+          Low alpha (~0.6) = adapts to current rhythm quickly.
+          High alpha (~0.97) = long-term average, slow to change.
+
+      'episodic' (circular buffer):
+          A ring buffer of the last K (bit, cos(φ), sin(φ)) tuples.
+          Prediction compares current phases to the circular mean of
+          recent observations for each bit value. Naturally adapts to
+          whatever rhythm is currently playing because the buffer only
+          holds recent history.
 
   3. Kick learning (Hebbian reinforcement):
-      The input kicks are adjusted based on prediction error. If wrong,
-      the kicks that would have helped the correct answer become
-      slightly more distinctive. No gradient computation — just
-      reinforcement of phase-input distinctiveness.
+      The input kicks are adjusted based on prediction error.
 
   Battery:
-      Decays each tick. Modulates kick magnitude — a lonely pipit
-      kicks harder (more reactive, more erratic output). This IS the
-      creature's emotional state: loneliness literally changes the
-      oscillation dynamics.
+      Decays each tick. Modulates kick magnitude.
 
-Why this isn't a neural network:
-  - No layers. No weight matrices multiplying activations.
-  - No gradient descent through a computation graph.
-  - Prediction is von-Mises similarity in phase space (a physics
-    kernel, not a learned function).
-  - Learning is Hebbian association + reinforcement of kicks.
-  - Memory is circular statistics (running means of angles), not
-    a hidden state vector.
-  - The computational substrate is coupled oscillation.
-
-Pure numpy. ~300 lines.
+Pure numpy. ~400 lines.
 """
 
 from __future__ import annotations
@@ -64,14 +52,20 @@ DEFAULT_N_OSC = 16
 
 
 class OscillatorBrain:
-    """N coupled phase oscillators with phase-memory prediction.
+    """N coupled phase oscillators with configurable phase memory.
 
     Fixed: frequencies, coupling.
     Learned (Hebbian): phase-memory associations, input kick magnitudes.
+
+    memory_mode='ema':      EMA phase memory (set mem_alpha for decay speed)
+    memory_mode='episodic': circular buffer of last buf_size observations
     """
 
-    def __init__(self, n_osc=DEFAULT_N_OSC, rng=None):
+    def __init__(self, n_osc=DEFAULT_N_OSC, memory_mode='ema',
+                 mem_alpha=0.97, mem_alpha_short=0.5, buf_size=32,
+                 rng=None):
         self.n_osc = n_osc
+        self.memory_mode = memory_mode
         self.rng = rng if rng is not None else np.random.default_rng()
 
         # --- Oscillator bank (fixed structure) ---
@@ -90,10 +84,26 @@ class OscillatorBrain:
         self.kick += self.rng.normal(0, 0.1, (n_osc, VOCAB_SIZE))
         self.kick_lr = 0.001
 
-        # --- Phase memory (Hebbian, EMA of circular stats) ---
+        # --- Long-term EMA phase memory (direction) ---
+        self.mem_alpha = mem_alpha
         self.mem_cos = np.zeros((n_osc, VOCAB_SIZE))
         self.mem_sin = np.zeros((n_osc, VOCAB_SIZE))
-        self.mem_alpha = 0.97   # EMA decay
+
+        # --- Short-term EMA (confidence / coherence) ---
+        # Used by 'dual' mode: tracks recent phase-input consistency.
+        # High R_short = this oscillator is entrained RIGHT NOW = trust it.
+        # Low R_short = drifting = ignore its vote.
+        self.mem_alpha_short = mem_alpha_short
+        self.short_cos = np.zeros((n_osc, VOCAB_SIZE))
+        self.short_sin = np.zeros((n_osc, VOCAB_SIZE))
+
+        # --- Episodic buffer ---
+        self.buf_size = buf_size
+        self.buf_cos = np.zeros((buf_size, n_osc))
+        self.buf_sin = np.zeros((buf_size, n_osc))
+        self.buf_bit = np.full(buf_size, -1, dtype=np.int64)
+        self.buf_ptr = 0
+        self.buf_count = 0
 
         # Readout temperature
         self.temperature = 1.0
@@ -124,15 +134,10 @@ class OscillatorBrain:
     def get_state(self):
         return self._phase_features()
 
-    # -- phase-memory prediction ---------------------------------------
+    # -- prediction ----------------------------------------------------
 
-    def _predict_from_memory(self):
-        """Score each vocab item by von-Mises similarity.
-
-        R * cos(φ - μ) = cos(φ) * mem_cos + sin(φ) * mem_sin
-        (the entrainment R is implicitly encoded in the magnitude of
-        mem_cos and mem_sin — an entrained oscillator has large magnitude).
-        """
+    def _predict_ema(self):
+        """Predict from EMA phase memory (von-Mises similarity)."""
         cos_phi = np.cos(self.phi)
         sin_phi = np.sin(self.phi)
         scores = np.zeros(VOCAB_SIZE)
@@ -140,6 +145,95 @@ class OscillatorBrain:
             scores[v] = np.sum(cos_phi * self.mem_cos[:, v]
                                + sin_phi * self.mem_sin[:, v])
         return self._softmax(scores, self.temperature)
+
+    def _predict_episodic(self):
+        """Predict from episodic buffer (nearest-neighbor in phase space)."""
+        if self.buf_count == 0:
+            return np.ones(VOCAB_SIZE) / VOCAB_SIZE
+
+        cos_phi = np.cos(self.phi)
+        sin_phi = np.sin(self.phi)
+
+        # Only look at valid entries
+        valid = min(self.buf_count, self.buf_size)
+        bc = self.buf_cos[:valid]
+        bs = self.buf_sin[:valid]
+        bb = self.buf_bit[:valid]
+
+        scores = np.zeros(VOCAB_SIZE)
+        for v in range(VOCAB_SIZE):
+            mask = (bb == v)
+            n_v = mask.sum()
+            if n_v == 0:
+                continue
+            mean_cos = bc[mask].mean(axis=0)  # (n_osc,)
+            mean_sin = bs[mask].mean(axis=0)  # (n_osc,)
+            scores[v] = np.sum(cos_phi * mean_cos + sin_phi * mean_sin)
+
+        return self._softmax(scores, self.temperature)
+
+    def _predict_dual(self):
+        """Predict using two timescales: long-term direction + short-term confidence.
+
+        Long-term EMA (α=0.97): learned direction (what phase does each
+        oscillator prefer for each bit value).
+
+        Short-term EMA (α~0.5): current confidence. An oscillator is
+        confident when it has:
+          - High R for both bit values (consistent phase-input relationship)
+          - Well-separated directions for 0 vs 1 (can discriminate)
+
+        A slow oscillator that barely moves within a sequence has high R
+        but LOW separation — it looks the same for both bits. It gets
+        low confidence despite high consistency. That's the key: inertia
+        is not entrainment.
+
+        Prediction:
+            score_v = Σ_i  confidence_i  *  cos(φ_i - μ_long_i[v])
+        """
+        cos_phi = np.cos(self.phi)
+        sin_phi = np.sin(self.phi)
+
+        # Short-term confidence: R_short for each bit value
+        R_short = np.sqrt(self.short_cos**2 + self.short_sin**2)  # (n_osc, 2)
+
+        # Angular separation between short-term preferred phases for 0 vs 1
+        # μ_short[v] = atan2(short_sin[:, v], short_cos[:, v])
+        # separation = |sin(μ_short[0] - μ_short[1])| via cross-product
+        # sin(a-b) = sin(a)cos(b) - cos(a)sin(b)
+        R0_safe = np.maximum(R_short[:, 0], 1e-12)
+        R1_safe = np.maximum(R_short[:, 1], 1e-12)
+        sin_sep = np.abs(
+            (self.short_sin[:, 0] / R0_safe) * (self.short_cos[:, 1] / R1_safe)
+            - (self.short_cos[:, 0] / R0_safe) * (self.short_sin[:, 1] / R1_safe)
+        )  # (n_osc,)  0 = same direction, 1 = perpendicular
+
+        # Confidence = strong R for both bits AND well-separated directions
+        confidence = R_short[:, 0] * R_short[:, 1] * sin_sep  # (n_osc,)
+
+        scores = np.zeros(VOCAB_SIZE)
+        for v in range(VOCAB_SIZE):
+            # Long-term direction (normalized)
+            R_long = np.sqrt(self.mem_cos[:, v]**2 + self.mem_sin[:, v]**2)
+            R_long_safe = np.maximum(R_long, 1e-12)
+            dir_cos = self.mem_cos[:, v] / R_long_safe
+            dir_sin = self.mem_sin[:, v] / R_long_safe
+
+            # similarity = cos(φ - μ_long)
+            similarity = cos_phi * dir_cos + sin_phi * dir_sin
+
+            # Weight by discrimination confidence
+            scores[v] = np.sum(confidence * similarity)
+
+        return self._softmax(scores, self.temperature)
+
+    def _predict(self):
+        if self.memory_mode == 'ema':
+            return self._predict_ema()
+        elif self.memory_mode == 'dual':
+            return self._predict_dual()
+        else:
+            return self._predict_episodic()
 
     # -- core: one tick ------------------------------------------------
 
@@ -153,20 +247,44 @@ class OscillatorBrain:
             loss = -np.log(0.5)
             self._has_prediction = True
 
-        # -- 2. Update phase memory (Hebbian) --
+        # -- 2. Update memory --
+        cos_phi = np.cos(self.phi)
+        sin_phi = np.sin(self.phi)
+
+        # Short-term EMA ALWAYS updates — it's sensing, not learning.
+        # "What am I hearing right now?" is needed for prediction even
+        # during probing.
+        if self.memory_mode == 'dual':
+            a_s = self.mem_alpha_short
+            self.short_cos[:, input_bit] = (a_s * self.short_cos[:, input_bit]
+                                            + (1 - a_s) * cos_phi)
+            self.short_sin[:, input_bit] = (a_s * self.short_sin[:, input_bit]
+                                            + (1 - a_s) * sin_phi)
+
+        # Long-term EMA and episodic buffer only update when learning.
         if learn:
-            a = self.mem_alpha
-            self.mem_cos[:, input_bit] = (a * self.mem_cos[:, input_bit]
-                                          + (1 - a) * np.cos(self.phi))
-            self.mem_sin[:, input_bit] = (a * self.mem_sin[:, input_bit]
-                                          + (1 - a) * np.sin(self.phi))
+            if self.memory_mode in ('ema', 'dual'):
+                a = self.mem_alpha
+                self.mem_cos[:, input_bit] = (a * self.mem_cos[:, input_bit]
+                                              + (1 - a) * cos_phi)
+                self.mem_sin[:, input_bit] = (a * self.mem_sin[:, input_bit]
+                                              + (1 - a) * sin_phi)
+            if self.memory_mode == 'episodic':
+                self.buf_cos[self.buf_ptr] = cos_phi
+                self.buf_sin[self.buf_ptr] = sin_phi
+                self.buf_bit[self.buf_ptr] = input_bit
+                self.buf_ptr = (self.buf_ptr + 1) % self.buf_size
+                self.buf_count = min(self.buf_count + 1, self.buf_size)
 
         # -- 3. Kick adjustment (Hebbian reinforcement) --
         if learn and self._has_prediction:
             error = 1.0 - self._last_probs[input_bit]
             if error > 0.3:
-                R = np.sqrt(self.mem_cos[:, input_bit]**2
-                            + self.mem_sin[:, input_bit]**2)
+                if self.memory_mode in ('ema', 'dual'):
+                    R = np.sqrt(self.mem_cos[:, input_bit]**2
+                                + self.mem_sin[:, input_bit]**2)
+                else:
+                    R = np.zeros(self.n_osc)
                 need = (1.0 - R) * error
                 other = 1 - input_bit
                 self.kick[:, input_bit] += self.kick_lr * need
@@ -180,14 +298,14 @@ class OscillatorBrain:
         self.phi += self.omega + coupling
 
         # -- 5. Predict --
-        probs = self._predict_from_memory()
+        probs = self._predict()
         self._last_probs = probs
         return probs, float(loss)
 
     # -- prediction (no state change) ---------------------------------
 
     def predict_probs(self):
-        return self._predict_from_memory()
+        return self._predict()
 
     def predict_probs_from(self, bits):
         snap = self._snapshot()
@@ -200,9 +318,14 @@ class OscillatorBrain:
     # -- entrainment report --------------------------------------------
 
     def entrainment(self):
-        """Return per-oscillator entrainment strength for each vocab item."""
-        R = np.sqrt(self.mem_cos**2 + self.mem_sin**2)
-        return R   # (n_osc, VOCAB_SIZE)
+        """Return per-oscillator entrainment strength for each vocab item.
+        For dual mode, returns the short-term R (current confidence)."""
+        if self.memory_mode in ('ema', 'dual'):
+            if self.memory_mode == 'dual':
+                return np.sqrt(self.short_cos**2 + self.short_sin**2)
+            return np.sqrt(self.mem_cos**2 + self.mem_sin**2)
+        else:
+            return np.zeros((self.n_osc, VOCAB_SIZE))
 
     # -- state management ----------------------------------------------
 
@@ -212,6 +335,13 @@ class OscillatorBrain:
             'kick': self.kick.copy(),
             'mem_cos': self.mem_cos.copy(),
             'mem_sin': self.mem_sin.copy(),
+            'short_cos': self.short_cos.copy(),
+            'short_sin': self.short_sin.copy(),
+            'buf_cos': self.buf_cos.copy(),
+            'buf_sin': self.buf_sin.copy(),
+            'buf_bit': self.buf_bit.copy(),
+            'buf_ptr': self.buf_ptr,
+            'buf_count': self.buf_count,
             'last_probs': self._last_probs.copy(),
             'has_prediction': self._has_prediction,
         }
@@ -221,40 +351,69 @@ class OscillatorBrain:
         self.kick = snap['kick']
         self.mem_cos = snap['mem_cos']
         self.mem_sin = snap['mem_sin']
+        self.short_cos = snap['short_cos']
+        self.short_sin = snap['short_sin']
+        self.buf_cos = snap['buf_cos']
+        self.buf_sin = snap['buf_sin']
+        self.buf_bit = snap['buf_bit']
+        self.buf_ptr = snap['buf_ptr']
+        self.buf_count = snap['buf_count']
         self._last_probs = snap['last_probs']
         self._has_prediction = snap['has_prediction']
 
     def reset_phases(self, rng=None):
-        """Reset oscillator phases only. Memory + kicks preserved."""
+        """Reset oscillator phases and short-term coherence.
+        Long-term memory + kicks preserved."""
         rng = rng if rng is not None else self.rng
         self.phi = rng.uniform(0, 2 * np.pi, self.n_osc)
+        self.short_cos[:] = 0
+        self.short_sin[:] = 0
         self._last_probs = np.ones(VOCAB_SIZE) / VOCAB_SIZE
         self._has_prediction = False
 
     def reset_all(self, rng=None):
-        """Full reset: phases + memory + kicks."""
+        """Full reset: phases + all memory + kicks."""
         self.reset_phases(rng)
         self.mem_cos[:] = 0
         self.mem_sin[:] = 0
         self.kick[:, 0] = -0.3
         self.kick[:, 1] = +0.3
+        self.buf_cos[:] = 0
+        self.buf_sin[:] = 0
+        self.buf_bit[:] = -1
+        self.buf_ptr = 0
+        self.buf_count = 0
 
     # -- persistence ---------------------------------------------------
 
     def state_dict(self):
         return {
-            '_meta': {'n_osc': self.n_osc},
+            '_meta': {
+                'n_osc': self.n_osc,
+                'memory_mode': self.memory_mode,
+                'mem_alpha': self.mem_alpha,
+                'mem_alpha_short': self.mem_alpha_short,
+                'buf_size': self.buf_size,
+            },
             'omega': self.omega, 'K': self.K,
             'kick': self.kick,
             'mem_cos': self.mem_cos, 'mem_sin': self.mem_sin,
+            'short_cos': self.short_cos, 'short_sin': self.short_sin,
+            'buf_cos': self.buf_cos, 'buf_sin': self.buf_sin,
+            'buf_bit': self.buf_bit,
             'phi': self.phi,
         }
 
     def load_state(self, sd):
         if sd['_meta']['n_osc'] != self.n_osc:
             raise ValueError(f"n_osc mismatch")
-        for k in ['omega', 'K', 'kick', 'mem_cos', 'mem_sin', 'phi']:
-            setattr(self, k, sd[k])
+        for k in ['omega', 'K', 'kick', 'mem_cos', 'mem_sin',
+                   'short_cos', 'short_sin',
+                   'buf_cos', 'buf_sin', 'buf_bit', 'phi']:
+            if k in sd:
+                setattr(self, k, sd[k])
+        self.buf_ptr = 0
+        self.buf_count = int((self.buf_bit >= 0).sum())
         self._last_probs = self.predict_probs()
         self._has_prediction = False
 
@@ -303,13 +462,18 @@ class Pipit:
     """A bit-creature. Oscillators + phase memory + battery.
     No neural network. No backprop."""
 
-    def __init__(self, name='pipit', n_osc=DEFAULT_N_OSC, seed=None):
+    def __init__(self, name='pipit', n_osc=DEFAULT_N_OSC,
+                 memory_mode='ema', mem_alpha=0.97, mem_alpha_short=0.5,
+                 buf_size=32, seed=None):
         self.name = name
         self.seed = (int(seed) if seed is not None
                      else int(np.random.SeedSequence().entropy))
         self.rng = np.random.default_rng(self.seed)
         brng = np.random.default_rng(int(self.rng.integers(0, 2**63 - 1)))
-        self.brain = OscillatorBrain(n_osc=n_osc, rng=brng)
+        self.brain = OscillatorBrain(n_osc=n_osc, memory_mode=memory_mode,
+                                     mem_alpha=mem_alpha,
+                                     mem_alpha_short=mem_alpha_short,
+                                     buf_size=buf_size, rng=brng)
         self.battery = Battery()
         self.round = 0
         self.temperature = 0.7
@@ -394,8 +558,14 @@ class Pipit:
             meta = json.load(f)
         arrays = dict(np.load(path + '.npz'))
         bm = meta['brain_meta']
-        pipit = cls(name=meta['name'], n_osc=int(bm['n_osc']),
-                    seed=int(meta['seed']))
+        pipit = cls(
+            name=meta['name'], n_osc=int(bm['n_osc']),
+            memory_mode=bm.get('memory_mode', 'ema'),
+            mem_alpha=float(bm.get('mem_alpha', 0.97)),
+            mem_alpha_short=float(bm.get('mem_alpha_short', 0.5)),
+            buf_size=int(bm.get('buf_size', 32)),
+            seed=int(meta['seed']),
+        )
         pipit.round = int(meta['round'])
         pipit.temperature = float(meta.get('temperature', 0.7))
         brain_sd = {'_meta': bm}
@@ -407,8 +577,16 @@ class Pipit:
         return pipit
 
     def __repr__(self):
+        mode = self.brain.memory_mode
+        if mode == 'ema':
+            extra = f'alpha={self.brain.mem_alpha}'
+        elif mode == 'dual':
+            extra = (f'alpha={self.brain.mem_alpha},'
+                     f'short={self.brain.mem_alpha_short}')
+        else:
+            extra = f'buf={self.brain.buf_size}'
         return (f"Pipit('{self.name}', n_osc={self.brain.n_osc}, "
-                f"round={self.round})")
+                f"{mode}({extra}), round={self.round})")
 
 
 __all__ = ['OscillatorBrain', 'Battery', 'Pipit',

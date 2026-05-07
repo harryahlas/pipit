@@ -1,0 +1,16 @@
+{
+  "name": "spec_swelling",
+  "seed": 1,
+  "round": 3204036,
+  "temperature": 0.7,
+  "brain_meta": {
+    "n_osc": 32,
+    "memory_mode": "ema",
+    "mem_alpha": 0.97,
+    "mem_alpha_short": 0.5,
+    "buf_size": 32
+  },
+  "battery": {
+    "level": 0.18480000000008073
+  }
+}
