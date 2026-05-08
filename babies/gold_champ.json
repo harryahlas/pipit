@@ -1,0 +1,16 @@
+{
+  "name": "\u03b1_silver",
+  "seed": 4,
+  "round": 5000,
+  "brain_meta": {
+    "embed_dim": 16,
+    "brain_dim": 16,
+    "context": 32
+  },
+  "organs_meta": {
+    "brain_dim": 16
+  },
+  "battery": {
+    "level": 0.40499999999999936
+  }
+}

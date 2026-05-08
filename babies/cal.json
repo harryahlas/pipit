@@ -1,0 +1,16 @@
+{
+  "name": "cal",
+  "seed": 2,
+  "round": 30000,
+  "brain_meta": {
+    "embed_dim": 16,
+    "brain_dim": 16,
+    "context": 32
+  },
+  "organs_meta": {
+    "brain_dim": 16
+  },
+  "battery": {
+    "level": 1.0
+  }
+}
