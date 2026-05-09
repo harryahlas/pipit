@@ -518,6 +518,13 @@ class Pain:
 
     def __init__(self, brain_dim):
         self.brain_dim = brain_dim
+        # Master toggle for ablation. When False, all effective_*
+        # methods short-circuit to base values so pain has no
+        # behavioral influence. Pain still updates internally
+        # (we can read what would have been felt) but doesn't flow
+        # into the brain or the organs. Used to answer "is pain
+        # contributing constructively, or just along for the ride?"
+        self.enabled = True
         # Stored scalars
         self.sting_level = 0.0
         self.nausea_level = 0.0
@@ -530,8 +537,19 @@ class Pain:
         self.bs_ema_long = np.zeros(brain_dim)
         self._ema_initialized = False
 
-        # Update rates
-        self.alpha_sting = 0.10
+        # Update rates.
+        #
+        # alpha_sting was 0.10 (~7-pair half-life). But in a block-
+        # structured habitat each listen call is one class, so the
+        # sting signal alternates between ~0.8 during a confidently-
+        # wrong block and ~0 between them. With a 7-pair half-life
+        # the EMA tracks the within-block signal but decays close
+        # to zero before the next checkpoint sample. Result: a
+        # chronically-wrong creature looked un-stung when we
+        # measured it. 0.02 (~35-pair half-life) integrates across
+        # multiple blocks so sting is visible at any sampling
+        # moment, not just during the streak.
+        self.alpha_sting = 0.02
         self.alpha_itch = 0.10
         self.alpha_nausea = 0.10
         self.alpha_disquiet = 0.15      # faster than other pains
@@ -599,7 +617,16 @@ class Pain:
         nl = float(np.linalg.norm(l))
         if ns > 1e-9 and nl > 1e-9:
             cos_sim = float(np.dot(s, l) / (ns * nl))
-            nausea_signal = max(0.0, 1.0 - cos_sim)
+            # Clip to [0, 1]. cos_sim ranges [-1, 1], so 1 - cos_sim
+            # ranges [0, 2]. Without clipping, anti-aligned EMAs
+            # produce nausea > 1 → effective_lateral_weight < 0
+            # (lateral inversion). That can be a real mechanism —
+            # the first habitat run produced a transient near-perfect
+            # steady_2 specialist via this pathway — but it should be
+            # a deliberate experiment with clear knobs, not an
+            # overflow bug. Held for a future explicit "lateral
+            # inversion" pain.
+            nausea_signal = float(np.clip(1.0 - cos_sim, 0.0, 1.0))
         else:
             nausea_signal = 0.0
         a = self.alpha_nausea
@@ -633,29 +660,44 @@ class Pain:
                              0.0, 1.0))
 
     # ── Effective behavioral knobs ───────────────────────────────────
+    #
+    # Each method takes the underlying base value (organ temperature,
+    # brain context, etc) and returns the modulated version that the
+    # creature should actually use. When self.enabled is False, every
+    # method short-circuits to the base value — used for ablation.
 
     def effective_temperature(self, base_temp):
         """Sting raises temperature: stung creatures hedge."""
+        if not self.enabled:
+            return base_temp
         return base_temp * (1.0 + 2.0 * self.sting_level)
 
     def effective_context(self, base_context, recent_brain_losses, round_):
         """Hunger shortens context."""
+        if not self.enabled:
+            return base_context
         h = self.hunger_level(recent_brain_losses, round_)
         eff = int(base_context * (1.0 - 0.75 * h))
         return max(4, eff)
 
     def effective_lateral_weight(self, base_weight):
         """Nausea suppresses lateral: stop trusting habits during regime change."""
+        if not self.enabled:
+            return base_weight
         return base_weight * (1.0 - self.nausea_level)
 
     def effective_sensitivity_lr(self, base_lr):
         """Itch accelerates body alignment."""
+        if not self.enabled:
+            return base_lr
         return base_lr * (1.0 + 4.0 * self.itch_level)
 
     def effective_brain_lr(self, base_lr):
         """Disquiet adds urgency. Capped at 2x to prevent runaway
         when combined with the existing loneliness 2x (which is
         applied externally by habitat/evolve)."""
+        if not self.enabled:
+            return base_lr
         return base_lr * min(1.0 + self.disquiet_level, 2.0)
 
     # ── Reporting ────────────────────────────────────────────────────
@@ -699,6 +741,159 @@ class Pain:
 
 
 # ----------------------------------------------------------------------
+#  PainfulMemory — durable replay buffer for past hurts
+# ----------------------------------------------------------------------
+
+class PainfulMemory:
+    """A small library of confidently-wrong moments. Captured during
+    listen() when sting exceeds a threshold; sampled during listen()
+    to nudge training back toward past hurt.
+
+    This addresses what Pain v1 failed to do: it gives the creature
+    a durable, specific, contextual memory of past errors. Pain v1
+    was a transient mood — five scalars that decayed between rounds.
+    PainfulMemory is episodic — specific (prefix, target) pairs that
+    persist across thousands of rounds and can be re-triggered when
+    the same context recurs.
+
+    Biology: Aplysia gill-withdrawal sensitization, hippocampal
+    replay, taste aversion learning. A single painful event creates
+    a durable, specific association between a context (a tail
+    touch, a food taste, a bit-prefix) and an outcome.
+
+    Design choices:
+
+    Capture happens BEFORE the gradient step, not after. The pair
+    the brain just got confidently wrong on is the useful training
+    signal; capturing post-step would record a slightly-stale sting
+    because the brain has already begun to correct.
+
+    No decay. A memory's sting is fixed at capture time. If the
+    creature has learned to be correct on that prefix, the memory
+    won't generate new sting events to refresh — but it also won't
+    fade. It stays as a "don't forget this lesson" anchor. The
+    capacity-limited eviction (lowest sting displaced first) is the
+    only way memories leave the buffer.
+
+    Dedup by (prefix, target). Capturing an identical pair twice
+    updates the existing entry's sting (keeping the max) rather
+    than filling the buffer with copies of the same hard case.
+
+    Replay sampling is weighted by sting. Most-painful memories
+    replay most often. Within a fixed budget of train_pairs per
+    listen, the buffer competes with fresh world samples.
+    """
+
+    def __init__(self, capacity=32, capture_threshold=0.4,
+                 replay_p=0.25):
+        self.capacity = int(capacity)
+        self.capture_threshold = float(capture_threshold)
+        self.replay_p = float(replay_p)
+        self.entries = []   # list of {'prefix': [int], 'target': int, 'sting': float}
+        # Master toggle for ablation
+        self.enabled = True
+
+    # ── Capture ──────────────────────────────────────────────────────
+
+    def maybe_capture(self, prefix, target, brain_probs_pre):
+        """If the brain was confidently wrong on this pair, store it.
+
+        Returns True if a capture happened, False otherwise. The
+        return value is for diagnostics; callers can ignore it."""
+        if not self.enabled:
+            return False
+        confidence = float(np.max(brain_probs_pre))
+        wrongness = float(1.0 - brain_probs_pre[int(target)])
+        sting = confidence * wrongness
+        if sting < self.capture_threshold:
+            return False
+
+        prefix_list = [int(b) for b in prefix]
+        target_int = int(target)
+
+        # Dedup: if (prefix, target) already in buffer, just update sting
+        for e in self.entries:
+            if e['target'] == target_int and e['prefix'] == prefix_list:
+                e['sting'] = max(e['sting'], float(sting))
+                return True
+
+        entry = {
+            'prefix': prefix_list,
+            'target': target_int,
+            'sting': float(sting),
+        }
+
+        if len(self.entries) < self.capacity:
+            self.entries.append(entry)
+            return True
+
+        # Buffer full: evict lowest-sting entry IF new entry beats it
+        min_idx = min(range(len(self.entries)),
+                      key=lambda i: self.entries[i]['sting'])
+        if self.entries[min_idx]['sting'] < sting:
+            self.entries[min_idx] = entry
+            return True
+        return False
+
+    # ── Replay ───────────────────────────────────────────────────────
+
+    def maybe_replay(self, rng):
+        """Maybe return a (prefix, target) from the buffer for training.
+
+        Returns None if no replay should happen this call (either the
+        buffer is empty/disabled, or the random draw didn't fire).
+        Caller should fall through to normal world-based selection."""
+        if not self.enabled:
+            return None
+        if not self.entries:
+            return None
+        if rng.random() > self.replay_p:
+            return None
+        # Sample weighted by sting (more painful = more likely to replay)
+        weights = np.array([e['sting'] for e in self.entries], dtype=np.float64)
+        total = float(weights.sum())
+        if total < 1e-12:
+            return None
+        probs = weights / total
+        idx = int(rng.choice(len(self.entries), p=probs))
+        e = self.entries[idx]
+        return list(e['prefix']), int(e['target'])
+
+    # ── Reporting ────────────────────────────────────────────────────
+
+    def report(self):
+        """Snapshot summary of buffer state."""
+        if not self.entries:
+            return {'size': 0, 'mean_sting': 0.0, 'max_sting': 0.0,
+                    'min_sting': 0.0}
+        stings = [e['sting'] for e in self.entries]
+        return {
+            'size': len(self.entries),
+            'mean_sting': float(np.mean(stings)),
+            'max_sting': float(np.max(stings)),
+            'min_sting': float(np.min(stings)),
+        }
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def state_dict(self):
+        return {
+            'capacity': self.capacity,
+            'capture_threshold': self.capture_threshold,
+            'replay_p': self.replay_p,
+            'enabled': self.enabled,
+            'entries': self.entries,
+        }
+
+    def load_state(self, sd):
+        self.capacity = int(sd['capacity'])
+        self.capture_threshold = float(sd['capture_threshold'])
+        self.replay_p = float(sd['replay_p'])
+        self.enabled = bool(sd['enabled'])
+        self.entries = list(sd['entries'])
+
+
+# ----------------------------------------------------------------------
 #  Bittern — the creature
 # ----------------------------------------------------------------------
 
@@ -724,6 +919,7 @@ class Bittern:
         self.organs = Organs(brain_dim=brain_dim, rng=orng)
         self.battery = Battery()
         self.pain = Pain(brain_dim=brain_dim)
+        self.painful_memory = PainfulMemory()
         self.round = 0
         self.recent_brain_losses = []
 
@@ -774,28 +970,48 @@ class Bittern:
         this_call_losses = []      # for disquiet
 
         for _ in range(max(1, train_pairs)):
-            if balanced and pos_0 and pos_1:
-                # Alternate targets: half from 0-pool, half from 1-pool
-                pool = pos_1 if self.rng.random() < 0.5 else pos_0
-                split = int(self.rng.choice(pool))
+            # Replay or fresh? PainfulMemory may return a past pair
+            # to retrain on; otherwise we draw from the current world.
+            replay = self.painful_memory.maybe_replay(self.rng)
+            if replay is not None:
+                prefix, target = replay
+                # Truncate to current effective context for consistency
+                # with world-based pairs (under hunger, eff_context may
+                # be smaller than the captured prefix length).
+                if len(prefix) > eff_context:
+                    prefix = prefix[-eff_context:]
             else:
-                split = int(self.rng.integers(1, len(bits)))
-            start = max(0, split - eff_context)
-            prefix = list(bits[start:split])
-            target = int(bits[split])
+                if balanced and pos_0 and pos_1:
+                    # Alternate targets: half from 0-pool, half from 1-pool
+                    pool = pos_1 if self.rng.random() < 0.5 else pos_0
+                    split = int(self.rng.choice(pool))
+                else:
+                    split = int(self.rng.integers(1, len(bits)))
+                start = max(0, split - eff_context)
+                prefix = list(bits[start:split])
+                target = int(bits[split])
 
-            # Self-hearing: replace some prefix bits with brain's own
-            # predictions. Scheduled sampling.
-            if self_hear_p > 0 and len(prefix) > 1:
-                for t in range(1, len(prefix)):
-                    if self.rng.random() < self_hear_p:
-                        probs = self.brain.predict_probs(prefix[:t])
-                        prefix[t] = int(
-                            self.rng.choice(VOCAB_SIZE, p=probs))
+                # Self-hearing: replace some prefix bits with brain's own
+                # predictions. Scheduled sampling. Only applied to
+                # fresh-from-world pairs, not replays.
+                if self_hear_p > 0 and len(prefix) > 1:
+                    for t in range(1, len(prefix)):
+                        if self.rng.random() < self_hear_p:
+                            probs = self.brain.predict_probs(prefix[:t])
+                            prefix[t] = int(
+                                self.rng.choice(VOCAB_SIZE, p=probs))
 
             # Sting needs PRE-update brain probs (was the brain confident
             # about the wrong answer BEFORE this gradient step?).
             brain_probs_pre = self.brain.predict_probs(prefix)
+
+            # Capture into PainfulMemory BEFORE the gradient step. The
+            # pair the brain just got confidently wrong on is the
+            # signal we want to store; capturing post-step would
+            # record a slightly-stale sting because the brain has
+            # already begun to correct on this pair.
+            self.painful_memory.maybe_capture(prefix, target,
+                                              brain_probs_pre)
 
             # Disquiet adds urgency to the brain's learning rate.
             eff_brain_lr = self.pain.effective_brain_lr(lr)
@@ -896,16 +1112,25 @@ class Bittern:
         self.battery.decay()
 
     def reset_emotional_state(self):
-        """Reset battery, pain, round counter, and recent loss buffer.
+        """Reset battery, pain, painful memory, round counter, and
+        recent loss buffer.
 
         Used when a creature crosses a generational boundary (in
         evolve.py): the brain weights persist, but the felt-state of
         the creature starts fresh. Children of a parent get this
         automatically by being constructed via Bittern(...); the
         PARENT also needs it to enter the next generation as a peer
-        of its own children rather than a senior with stale moods."""
+        of its own children rather than a senior with stale moods.
+
+        PainfulMemory specifically resets here because it is NOT
+        heritable — children don't inherit their parent's memories,
+        so giving surviving parents their old buffer would mean
+        selection rewards "did this parent get lucky with their
+        buffer" rather than "is this brain a useful inheritance."
+        Within-lifetime memory experiments should not call this."""
         self.battery = Battery()
         self.pain = Pain(brain_dim=self.brain.brain_dim)
+        self.painful_memory = PainfulMemory()
         self.round = 0
         self.recent_brain_losses = []
 
@@ -945,6 +1170,7 @@ class Bittern:
                 'disquiet_level': float(p_dict['disquiet_level']),
                 'ema_initialized': bool(p_dict['ema_initialized']),
             },
+            'painful_memory': self.painful_memory.state_dict(),
         }
         with open(path + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
@@ -988,9 +1214,14 @@ class Bittern:
             bittern.pain.load_state(p_load)
         # else: bittern.pain was already constructed fresh in __init__
 
+        # PainfulMemory — backwards compatible with pre-memory saves.
+        if 'painful_memory' in meta:
+            bittern.painful_memory.load_state(meta['painful_memory'])
+        # else: bittern.painful_memory was already constructed fresh
+
         return bittern
 
 
-__all__ = ['Brain', 'Organs', 'Battery', 'Pain', 'Bittern',
+__all__ = ['Brain', 'Organs', 'Battery', 'Pain', 'PainfulMemory', 'Bittern',
            'VOCAB_SIZE', 'DEFAULT_EMBED_DIM', 'DEFAULT_BRAIN_DIM',
            'DEFAULT_CONTEXT']

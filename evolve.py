@@ -19,6 +19,7 @@ design, no hyperparameter tuning mid-run. Whatever wins, wins.
     python evolve.py                              # 8 creatures, 10 generations
     python evolve.py --pop 12 --generations 15    # bigger tournament
     python evolve.py --rounds 8000 --sigma 0.03   # tune pressure
+    python evolve.py --no-pain                    # ablation: pain disabled
 
 Architecture:
 
@@ -35,6 +36,27 @@ Architecture:
     Generation 1:  [b0] [b1] [b2] [b3] [b4] [b5] [b6] [b7]
                     parents       children (mutated clones)
                     ...repeat...
+
+Two changes from the original:
+
+  (1) The loneliness lr-multiplier was removed. The sigma=0
+      diagnostic showed that with `effective_lr = lr * (2.0 if
+      lonely else 1.0)`, champions DEGRADED across generations even
+      with no mutation — same brain weights, same world, identical
+      opponents, but each successive generation re-trained the brain
+      destructively when batteries crashed. With the multiplier
+      removed, champions accumulate progress generation over
+      generation, and the loner control no longer beats them.
+
+  (2) Surviving parents now call `reset_emotional_state()` rather
+      than just `Battery()` — so parents enter the next generation
+      with the same pain warmup as their children, equalizing the
+      starting conditions and making selection operate on brain
+      weights rather than on stale emotional state.
+
+  (3) A `--no-pain` CLI flag is wired through to disable the pain
+      system on every creature (gen 0, every child, the loner). Use
+      it to compare with-pain vs without-pain champions.
 """
 
 from __future__ import annotations
@@ -74,10 +96,7 @@ def spawn(parent, child_name, sigma=0.02, rng=None):
 
     Brain weights are copied and mutated (Gaussian noise, scale sigma).
     Organs are fresh (they learn via Hebbian during training anyway).
-    Battery starts full. Round counter resets.
-
-    This is asexual reproduction with mutation — the simplest thing
-    that could produce variation for selection to act on.
+    Battery starts full. Round counter resets. Pain is fresh.
     """
     rng = rng or np.random.default_rng()
 
@@ -98,14 +117,30 @@ def spawn(parent, child_name, sigma=0.02, rng=None):
     return child
 
 
+def _set_pain(c, enabled):
+    """Helper: flip the pain master toggle on a creature."""
+    c.pain.enabled = bool(enabled)
+
+
+def _set_replay(c, enabled):
+    """Helper: flip the painful-memory master toggle on a creature."""
+    c.painful_memory.enabled = bool(enabled)
+
+
 # ── Competitive habitat (one generation) ─────────────────────────────
 
 def run_generation(creatures, train_corpus, rounds, lr, block_size):
     """Train a population together in a competitive habitat.
 
-    Same mechanics as habitat.py v3: winner gets 6 train pairs + battery,
-    losers get 2 train pairs + bleed. Lonely creatures learn at 2x lr.
-    Block-structured world for sustained winning/losing streaks.
+    Winner gets 6 train pairs + battery, losers get 2 train pairs +
+    bleed. Block-structured world for sustained winning/losing
+    streaks.
+
+    The loneliness 2x lr-multiplier was removed in this version
+    (see module docstring for the diagnostic). Lonely creatures
+    train at the same rate as everyone else; battery dynamics
+    still affect emotion bias and the (now-disabled-able) pain
+    system, but they no longer reach into raw lr.
     """
     # Build block-structured order
     by_class = {}
@@ -154,12 +189,12 @@ def run_generation(creatures, train_corpus, rounds, lr, block_size):
         winner_idx = int(np.argmin(scores))
         win_counts[creatures[winner_idx].name] += 1
 
-        # Competitive learning + battery
+        # Competitive learning + battery.
+        # Loneliness lr-multiplier removed — see module docstring.
         for i, c in enumerate(creatures):
             is_winner = (i == winner_idx)
-            effective_lr = lr * (2.0 if c.battery.is_lonely() else 1.0)
             tp = 6 if is_winner else 2
-            c.listen(world_bits, train_pairs=tp, lr=effective_lr)
+            c.listen(world_bits, train_pairs=tp, lr=lr)
             c.step()
             if is_winner:
                 c.battery.replenish(0.06)
@@ -203,7 +238,8 @@ PROBE_PROMPTS = [
 
 def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
            seed=0, sigma=0.02, lr=0.02, block_size=20, out='babies',
-           names=None, champion_name='champion'):
+           names=None, champion_name='champion',
+           pain_enabled=True, replay_enabled=True):
     """Run the tournament."""
     rng = np.random.default_rng(seed)
 
@@ -216,6 +252,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     print(f"\n{'='*65}")
     print(f"  EVOLUTION — {pop_size} creatures, {generations} generations")
     print(f"  {rounds_per_gen} rounds/gen, sigma={sigma}, block={block_size}")
+    print(f"  pain:   {'ON' if pain_enabled else 'OFF (ablation)'}")
+    print(f"  replay: {'ON' if replay_enabled else 'OFF (ablation)'}")
     print(f"{'='*65}")
 
     creatures = []
@@ -223,6 +261,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     for i in range(pop_size):
         name = f"{GEN_PREFIX[0]}_{name_pool[i % len(name_pool)]}"
         c = Bittern(name=name, seed=seed + i)
+        _set_pain(c, pain_enabled)
+        _set_replay(c, replay_enabled)
         creatures.append(c)
 
     champion_history = []
@@ -288,15 +328,23 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
             next_gen = []
             next_label = GEN_PREFIX[min(gen + 1, len(GEN_PREFIX)-1)]
             for i, parent in enumerate(survivors):
-                # Parent survives (keeps its trained brain)
-                parent.battery = Battery()  # fresh battery
-                parent.round = 0
+                # Parent survives. Reset emotional state (battery,
+                # pain, painful_memory, round, recent_brain_losses)
+                # so the parent enters the next generation as a peer
+                # of its own children rather than a senior with stale
+                # moods. The trained brain weights persist; everything
+                # else is fresh.
+                parent.reset_emotional_state()
+                _set_pain(parent, pain_enabled)
+                _set_replay(parent, replay_enabled)
                 next_gen.append(parent)
 
                 # One child per parent
                 child_name = (f"{next_label}_"
                               f"{name_pool[(i + pop_size//2) % len(name_pool)]}")
                 child = spawn(parent, child_name, sigma=sigma, rng=rng)
+                _set_pain(child, pain_enabled)
+                _set_replay(child, replay_enabled)
                 next_gen.append(child)
                 print(f"    {parent.name} → {child.name} (σ={sigma})")
 
@@ -305,6 +353,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     # Final summary
     print(f"\n{'='*65}")
     print(f"  EVOLUTION COMPLETE — champion trajectory")
+    print(f"  pain:   {'ON' if pain_enabled else 'OFF (ablation)'}")
+    print(f"  replay: {'ON' if replay_enabled else 'OFF (ablation)'}")
     print(f"{'='*65}")
     for h in champion_history:
         pc = h['per_class']
@@ -322,6 +372,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     total_rounds = rounds_per_gen * generations
     print(f"\n  control: loner trained {total_rounds} rounds (no competition)")
     loner = Bittern(name='loner', seed=seed + 999)
+    _set_pain(loner, pain_enabled)
+    _set_replay(loner, replay_enabled)
     for r in range(total_rounds):
         item = train_corpus[r % len(train_corpus)]
         loner.listen(item['bits'], train_pairs=4, lr=lr)
@@ -355,6 +407,10 @@ def main():
                    help='comma-separated creature names (e.g. "zip,zap,zop,zug")')
     p.add_argument('--champion', type=str, default='champion',
                    help='save name for the winner (default: champion)')
+    p.add_argument('--no-pain', action='store_true',
+                   help='disable the pain system entirely (ablation control)')
+    p.add_argument('--no-replay', action='store_true',
+                   help='disable the painful-memory replay buffer (ablation control)')
     args = p.parse_args()
 
     name_list = args.names.split(',') if args.names else None
@@ -362,7 +418,9 @@ def main():
     evolve(pop_size=args.pop, generations=args.generations,
            rounds_per_gen=args.rounds, seed=args.seed,
            sigma=args.sigma, lr=args.lr, block_size=args.block_size,
-           out=args.out, names=name_list, champion_name=args.champion)
+           out=args.out, names=name_list, champion_name=args.champion,
+           pain_enabled=not args.no_pain,
+           replay_enabled=not args.no_replay)
 
 
 if __name__ == '__main__':

@@ -116,7 +116,7 @@ class Habitat:
             is_winner = (i == winner_idx)
 
             # Lonely creatures learn faster (desperation)
-            effective_lr = lr * (2.0 if c.battery.is_lonely() else 1.0)
+            effective_lr = lr  # loneliness lr-multiplier disabled (see evolve.py) #effective_lr = lr * (2.0 if c.battery.is_lonely() else 1.0)
 
             # Winner gets more training
             tp = 6 if is_winner else 2
@@ -193,6 +193,11 @@ class Habitat:
             r = probe_report(c, eval_corpus, PROBE_PROMPTS,
                              label=f"{c.name} @ {c.round}")
             results[c.name] = r
+         
+        from pain_probes import pain_summary, behavioral_trace_summary
+        for c in self.creatures:
+            pain_summary(c, label=f"{c.name} @ {c.round}")
+            behavioral_trace_summary(c)
 
         # Comparative per-class table
         print(f"\n  Per-class CE comparison:")
