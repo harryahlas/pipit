@@ -97,6 +97,13 @@ def spawn(parent, child_name, sigma=0.02, rng=None):
     Brain weights are copied and mutated (Gaussian noise, scale sigma).
     Organs are fresh (they learn via Hebbian during training anyway).
     Battery starts full. Round counter resets. Pain is fresh.
+
+    Scars are STRUCTURAL and HERITABLE. The child receives a deep
+    copy of the parent's scar buffer — same scar directions, same
+    enabled flag. Scar capacity loss is part of the inheritance:
+    a child of a 4-scar parent starts life with 4 dimensions of
+    brain_state already carved out. This is the substrate
+    selection is supposed to operate on.
     """
     rng = rng or np.random.default_rng()
 
@@ -114,6 +121,9 @@ def spawn(parent, child_name, sigma=0.02, rng=None):
         noise = rng.normal(0, sigma, parent_w.shape)
         setattr(child.brain, pname, parent_w.copy() + noise)
 
+    # Inherit scars structurally. Deep-copy via clone_for_child.
+    child.scars = parent.scars.clone_for_child()
+
     return child
 
 
@@ -125,6 +135,16 @@ def _set_pain(c, enabled):
 def _set_replay(c, enabled):
     """Helper: flip the painful-memory master toggle on a creature."""
     c.painful_memory.enabled = bool(enabled)
+
+
+def _set_scars(c, enabled):
+    """Helper: flip the scar master toggle on a creature.
+
+    Note: this only affects whether scars are CONSULTED (projection
+    + capture). The buffer's contents are preserved either way, so
+    you can ablate a creature mid-experiment without destroying its
+    accumulated scars."""
+    c.scars.enabled = bool(enabled)
 
 
 # ── Competitive habitat (one generation) ─────────────────────────────
@@ -239,7 +259,8 @@ PROBE_PROMPTS = [
 def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
            seed=0, sigma=0.02, lr=0.02, block_size=20, out='babies',
            names=None, champion_name='champion',
-           pain_enabled=True, replay_enabled=True):
+           pain_enabled=True, replay_enabled=True,
+           scars_enabled=True):
     """Run the tournament."""
     rng = np.random.default_rng(seed)
 
@@ -254,6 +275,7 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     print(f"  {rounds_per_gen} rounds/gen, sigma={sigma}, block={block_size}")
     print(f"  pain:   {'ON' if pain_enabled else 'OFF (ablation)'}")
     print(f"  replay: {'ON' if replay_enabled else 'OFF (ablation)'}")
+    print(f"  scars:  {'ON' if scars_enabled else 'OFF (ablation)'}")
     print(f"{'='*65}")
 
     creatures = []
@@ -263,6 +285,7 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
         c = Bittern(name=name, seed=seed + i)
         _set_pain(c, pain_enabled)
         _set_replay(c, replay_enabled)
+        _set_scars(c, scars_enabled)
         creatures.append(c)
 
     champion_history = []
@@ -299,8 +322,12 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
             marker = '♛' if rank == 0 else '·' if rank < pop_size // 2 else '✗'
             pc_str = '  '.join(
                 f"{cls}={ce:.3f}" for cls, ce in sorted(r['per_class'].items()))
+            sr = c.scars.report()
+            sc_str = (f"scars={sr['size']}/{sr['capacity']}"
+                      + (f" max_cos={sr['max_pairwise_cos']:+.2f}"
+                         if sr['size'] >= 2 else ""))
             print(f"    {marker} {rank+1}. {c.name:12s}  "
-                  f"CE={r['tf_ce']:.3f}  ({pc_str})")
+                  f"CE={r['tf_ce']:.3f}  {sc_str}  ({pc_str})")
 
         # Champion babble
         champ = results[0]['creature']
@@ -310,11 +337,18 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
             print(f"    {p['class']:10s}  {bits_to_str(p['bits'])} → "
                   f"{bits_to_str(bb)}")
 
+        # Champion scar trajectory: snapshot scar directions per gen.
+        # Stored as a (k, brain_dim) array so we can later compare
+        # whether independent lineages converge on similar scars.
+        champ_dirs = champ.scars.directions()
         champion_history.append({
             'gen': gen,
             'name': champ.name,
             'tf_ce': results[0]['tf_ce'],
             'per_class': results[0]['per_class'],
+            'scars_size': champ.scars.report()['size'],
+            'scars_directions': (champ_dirs.tolist()
+                                  if champ_dirs is not None else []),
         })
 
         # Selection + reproduction (skip on last generation)
@@ -334,19 +368,32 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
                 # of its own children rather than a senior with stale
                 # moods. The trained brain weights persist; everything
                 # else is fresh.
+                #
+                # SCARS specifically are NOT touched by reset_emotional_state
+                # — they are structural. A surviving parent enters
+                # the next generation with the same scar buffer it
+                # ended this generation with.
+                parent_scars_before = len(parent.scars.vectors)
                 parent.reset_emotional_state()
+                assert len(parent.scars.vectors) == parent_scars_before, (
+                    "reset_emotional_state should not touch scars")
                 _set_pain(parent, pain_enabled)
                 _set_replay(parent, replay_enabled)
+                _set_scars(parent, scars_enabled)
                 next_gen.append(parent)
 
-                # One child per parent
+                # One child per parent. spawn() copies the parent's
+                # scars deep into the child via clone_for_child.
                 child_name = (f"{next_label}_"
                               f"{name_pool[(i + pop_size//2) % len(name_pool)]}")
                 child = spawn(parent, child_name, sigma=sigma, rng=rng)
                 _set_pain(child, pain_enabled)
                 _set_replay(child, replay_enabled)
+                _set_scars(child, scars_enabled)
                 next_gen.append(child)
-                print(f"    {parent.name} → {child.name} (σ={sigma})")
+                inh = len(child.scars.vectors)
+                print(f"    {parent.name} → {child.name} "
+                      f"(σ={sigma}, scars inherited={inh})")
 
             creatures = next_gen
 
@@ -355,18 +402,21 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     print(f"  EVOLUTION COMPLETE — champion trajectory")
     print(f"  pain:   {'ON' if pain_enabled else 'OFF (ablation)'}")
     print(f"  replay: {'ON' if replay_enabled else 'OFF (ablation)'}")
+    print(f"  scars:  {'ON' if scars_enabled else 'OFF (ablation)'}")
     print(f"{'='*65}")
     for h in champion_history:
         pc = h['per_class']
         pc_str = '  '.join(f"{cls}={ce:.3f}" for cls, ce in sorted(pc.items()))
         print(f"  gen {h['gen']:2d}  {h['name']:12s}  CE={h['tf_ce']:.3f}  "
-              f"({pc_str})")
+              f"scars={h['scars_size']}  ({pc_str})")
 
     # Final champion full probe
     final_champ = results[0]['creature']
     print(f"\n  final champion: {final_champ.name}")
     probe_report(final_champ, eval_corpus, PROBE_PROMPTS,
                  label=f"CHAMPION {final_champ.name}")
+    # Final scar report
+    print(f"\n  final champion scars: {final_champ.scars.report()}")
 
     # Compare to a loner trained for the same total rounds
     total_rounds = rounds_per_gen * generations
@@ -374,6 +424,7 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     loner = Bittern(name='loner', seed=seed + 999)
     _set_pain(loner, pain_enabled)
     _set_replay(loner, replay_enabled)
+    _set_scars(loner, scars_enabled)
     for r in range(total_rounds):
         item = train_corpus[r % len(train_corpus)]
         loner.listen(item['bits'], train_pairs=4, lr=lr)
@@ -411,6 +462,8 @@ def main():
                    help='disable the pain system entirely (ablation control)')
     p.add_argument('--no-replay', action='store_true',
                    help='disable the painful-memory replay buffer (ablation control)')
+    p.add_argument('--no-scars', action='store_true',
+                   help='disable the scar system entirely (ablation control)')
     args = p.parse_args()
 
     name_list = args.names.split(',') if args.names else None
@@ -420,7 +473,8 @@ def main():
            sigma=args.sigma, lr=args.lr, block_size=args.block_size,
            out=args.out, names=name_list, champion_name=args.champion,
            pain_enabled=not args.no_pain,
-           replay_enabled=not args.no_replay)
+           replay_enabled=not args.no_replay,
+           scars_enabled=not args.no_scars)
 
 
 if __name__ == '__main__':

@@ -52,6 +52,54 @@ DEFAULT_CONTEXT = 32
 
 
 # ----------------------------------------------------------------------
+#  Scar projection helper
+# ----------------------------------------------------------------------
+#
+# Pain v3's central operation: project a brain_state vector onto the
+# orthogonal complement of the subspace spanned by a creature's scars.
+#
+# A "scar" is a unit vector in brain_dim space, captured at a moment
+# of confident wrongness. Projecting bs off the span of all scars
+# means the creature literally cannot use those directions anymore —
+# they've been carved out of the geometry the brain operates in.
+#
+# Two important invariants:
+#   1. The projection is its own gradient. If P is the projector
+#      onto the orthogonal complement, then P is symmetric (P^T = P),
+#      so gradient flowing back through bs_proj = P @ bs becomes
+#      d_bs = P^T @ d_bs_proj = P @ d_bs_proj. Same helper for both.
+#   2. With scars=None, scars.enabled=False, or empty buffer, the
+#      function returns bs unchanged. This is what makes the
+#      "bit-identical when disabled" acceptance criterion hold.
+#
+# Implementation: QR-based proper orthogonal projection. Sequential
+# subtraction (`for s in scars: bs -= (bs·s)s`) only works when scars
+# are mutually orthogonal — which they aren't, because dedup at
+# cos<0.9 still allows scars at e.g. cos=0.85. QR handles the
+# non-orthogonal case correctly.
+
+def project_off_scars(bs, scars):
+    """Return bs with the scar subspace removed.
+
+    bs:    array of shape (brain_dim,) or (..., brain_dim).
+    scars: a Scars object, or None. If None, disabled, or empty,
+           bs is returned unchanged.
+
+    Used identically on the forward pass (project bs before W_out)
+    and the backward pass (project d_bs before flowing further back).
+    """
+    if scars is None or not scars.enabled or len(scars.vectors) == 0:
+        return bs
+    # Stack scars as columns: shape (brain_dim, k)
+    S = np.column_stack(scars.vectors)
+    # QR gives Q with orthonormal columns spanning the same subspace.
+    Q, _ = np.linalg.qr(S)
+    # bs - (bs @ Q) @ Q.T projects bs onto the orthogonal complement.
+    # Works for both 1-D and higher-D bs (last axis is brain_dim).
+    return bs - (bs @ Q) @ Q.T
+
+
+# ----------------------------------------------------------------------
 #  Brain — single-head causal attention with a next-bit head
 # ----------------------------------------------------------------------
 
@@ -143,12 +191,13 @@ class Brain:
                  'scale': scale}
         return brain_state, cache
 
-    def predict_probs(self, bits):
+    def predict_probs(self, bits, scars=None):
         bs, _ = self.encode(bits)
+        bs = project_off_scars(bs, scars)
         logits = bs @ self.W_out + self.b_out
         return self._softmax(logits, axis=-1)
 
-    def predict_fast(self, bits):
+    def predict_fast(self, bits, scars=None):
         """Forward pass without cache — for scoring only.
         Same math as predict_probs but skips cache dict construction."""
         bits = np.asarray(bits, dtype=np.int64)
@@ -167,16 +216,29 @@ class Brain:
             scores[self._causal_masks[T]] = -1e9
         attn = self._softmax(scores, axis=-1)
         bs = (attn @ V)[-1] @ self.W_o
+        bs = project_off_scars(bs, scars)
         logits = bs @ self.W_out + self.b_out
         return self._softmax(logits, axis=-1)
 
     # -- training ------------------------------------------------------
 
-    def train_step(self, bits, target_bit, lr=0.01):
-        """One forward+backward step. Returns CE loss."""
+    def train_step(self, bits, target_bit, lr=0.01, scars=None):
+        """One forward+backward step. Returns CE loss.
+
+        With scars: project bs onto the orthogonal complement of the
+        scar subspace before the readout, and project d_bs the same
+        way before flowing back into W_o. The projector is symmetric,
+        so forward and backward use the same helper.
+
+        With scars=None / disabled / empty buffer: bit-identical to
+        the no-scars implementation.
+        """
         bs, cache = self.encode(bits)
         if cache is None:
             return 0.0
+
+        # Forward: bs is consumed by W_out only after projection.
+        bs = project_off_scars(bs, scars)
 
         logits = bs @ self.W_out + self.b_out
         probs = self._softmax(logits, axis=-1)
@@ -188,6 +250,10 @@ class Brain:
         d_W_out = np.outer(bs, d_logits)                       # (brain_dim, 2)
         d_b_out = d_logits
         d_bs = self.W_out @ d_logits                           # (brain_dim,)
+
+        # Backward: project d_bs the same way before it flows further.
+        # P is symmetric, so dL/d_bs_unprojected = P @ dL/d_bs_projected.
+        d_bs = project_off_scars(d_bs, scars)
 
         # ----- W_o (only last position contributed to bs) -----
         attn_out_last = cache['attn_out'][-1]                  # (D,)
@@ -894,6 +960,218 @@ class PainfulMemory:
 
 
 # ----------------------------------------------------------------------
+#  Scars — pain v3, structural and heritable
+# ----------------------------------------------------------------------
+
+class Scars:
+    """A list of unit vectors in brain_dim space.
+
+    A scar is a direction the brain confidently used at a moment of
+    confident wrongness. After capture, that direction is permanently
+    subtracted from brain_state every time bs is consumed — by the
+    readout, by the organs, anywhere bs flows. The brain literally
+    cannot use those directions anymore. It must learn to encode
+    its predictions in the remaining (brain_dim - k) dimensions.
+
+    Why this is different from pain v1 and v2:
+
+    Pain v1 was a transient mood — five scalars that decayed each
+    round. Behavioral modulations affected what the creature DID in
+    the moment but did not change what it LEARNED. There was no
+    heritable substrate for selection.
+
+    Pain v2 was a replay buffer. Stored (prefix, target) pairs went
+    stale: a pair captured at round 500 represents the brain's
+    confusion AT round 500, but by round 3000 the brain has moved
+    on. Replaying that pair drags the brain backward to relearn
+    something it already corrected. Pain that the brain can erase
+    by learning isn't really pain.
+
+    A scar can't be erased. The projection happens at the boundary
+    where brain_state is consumed — by the time bs reaches W_out,
+    the scar dimension is already zero. No amount of weight tuning
+    in W_out, W_o, the attention block, or the embedding can
+    reintroduce it. The brain works around the missing dimension or
+    not at all. This is the persistence-of-meaning the previous two
+    designs lacked.
+
+    Design choices (fixed, do not tune adaptively):
+
+    Capacity: 4. With brain_dim=16, this caps capacity loss at 25%.
+    Capture threshold: 0.5 (matches pain v1 sting threshold for
+        confident-wrong: max_prob × (1 - prob_of_target) > 0.5).
+    Dedup cosine: 0.9. Two scars at cos >= 0.9 are merged by
+        averaging and re-normalizing — the existing scar is updated
+        in place. No new entry is added; insertion order is
+        preserved for eviction.
+    Eviction: oldest first (FIFO). NOT by any "scar strength"
+        scalar — strength scalars would re-introduce the moodlet
+        problem of pain v1. All scars are equally consequential
+        once captured.
+
+    Heritability: scars survive reset_emotional_state() and are
+    deep-copied to children at spawn time in evolve.py. They are
+    structural, not emotional.
+    """
+
+    DEFAULT_CAPACITY = 4
+    DEFAULT_CAPTURE_THRESHOLD = 0.5
+    DEFAULT_DEDUP_COS = 0.9
+
+    def __init__(self, brain_dim,
+                 capacity=DEFAULT_CAPACITY,
+                 capture_threshold=DEFAULT_CAPTURE_THRESHOLD,
+                 dedup_cos=DEFAULT_DEDUP_COS):
+        self.brain_dim = int(brain_dim)
+        self.capacity = int(capacity)
+        self.capture_threshold = float(capture_threshold)
+        self.dedup_cos = float(dedup_cos)
+        self.vectors = []   # list of np.ndarray, each shape (brain_dim,)
+                            # FIFO order: vectors[0] is oldest.
+        # Master toggle. With enabled=False, project_off_scars short-
+        # circuits to identity AND maybe_capture is a no-op. So the
+        # entire mechanism is bypassable for ablation.
+        self.enabled = True
+
+    # ── Capture ──────────────────────────────────────────────────────
+
+    def maybe_capture(self, brain_state, brain_probs, target_bit):
+        """If the brain was confidently wrong, store a scar.
+
+        brain_state: the UNPROJECTED bs at this moment. It will be
+            normalized inside this method. (Unprojected because the
+            scar is supposed to be a direction in the natural bs
+            space; the projected bs would be in the orthogonal
+            complement of existing scars, which is fine but loses
+            information about the specific direction that failed.)
+        brain_probs: the probabilities the brain actually emitted
+            for this prediction (these come from the PROJECTED bs,
+            since that's what passes through W_out). Used to
+            compute sting.
+        target_bit: the correct bit.
+
+        Returns True if a scar was captured (or merged into an
+        existing one), False otherwise. Return value is for
+        diagnostics; callers can ignore it.
+        """
+        if not self.enabled:
+            return False
+
+        confidence = float(np.max(brain_probs))
+        wrongness = float(1.0 - brain_probs[int(target_bit)])
+        sting = confidence * wrongness
+        if sting < self.capture_threshold:
+            return False
+
+        bs = np.asarray(brain_state, dtype=np.float64)
+        n = float(np.linalg.norm(bs))
+        if n < 1e-9:
+            # Degenerate brain_state, no meaningful direction
+            return False
+        v = bs / n   # unit vector
+
+        # Dedup: cos similarity with each existing scar. If any
+        # exceeds dedup_cos, merge by averaging and re-normalizing.
+        # The existing entry is updated in place; insertion order
+        # (and therefore eviction order) is preserved.
+        for i, s in enumerate(self.vectors):
+            cos = float(np.dot(v, s))   # both unit norm already
+            if cos >= self.dedup_cos:
+                avg = self.vectors[i] + v
+                an = float(np.linalg.norm(avg))
+                if an > 1e-9:
+                    self.vectors[i] = avg / an
+                # else: pathological (anti-aligned); leave unchanged
+                return True
+
+        # Genuinely new direction. Append; if over capacity, evict
+        # oldest (index 0).
+        self.vectors.append(v)
+        if len(self.vectors) > self.capacity:
+            self.vectors.pop(0)
+        return True
+
+    # ── Reporting ────────────────────────────────────────────────────
+
+    def report(self):
+        """Snapshot of buffer state."""
+        out = {
+            'size': len(self.vectors),
+            'capacity': self.capacity,
+            'enabled': bool(self.enabled),
+        }
+        if len(self.vectors) >= 2:
+            # Pairwise cosine similarities, off-diagonal only
+            cos = []
+            for i in range(len(self.vectors)):
+                for j in range(i + 1, len(self.vectors)):
+                    cos.append(float(np.dot(self.vectors[i],
+                                             self.vectors[j])))
+            out['mean_pairwise_cos'] = float(np.mean(cos))
+            out['max_pairwise_cos'] = float(np.max(cos))
+        else:
+            out['mean_pairwise_cos'] = 0.0
+            out['max_pairwise_cos'] = 0.0
+        return out
+
+    def directions(self):
+        """Return scar vectors as a (k, brain_dim) array, or None
+        if empty. For probes/diagnostics that want to track scar
+        directions across the lineage."""
+        if not self.vectors:
+            return None
+        return np.stack(self.vectors, axis=0)
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def state_dict(self):
+        return {
+            '_meta': {'brain_dim': self.brain_dim,
+                      'capacity': self.capacity,
+                      'capture_threshold': self.capture_threshold,
+                      'dedup_cos': self.dedup_cos},
+            'enabled': bool(self.enabled),
+            'vectors': (np.stack(self.vectors, axis=0)
+                        if self.vectors
+                        else np.zeros((0, self.brain_dim))),
+        }
+
+    def load_state(self, sd):
+        meta = sd['_meta']
+        if int(meta['brain_dim']) != self.brain_dim:
+            raise ValueError(
+                f"Scars brain_dim mismatch: this is {self.brain_dim} "
+                f"but saved is {meta['brain_dim']}")
+        self.capacity = int(meta['capacity'])
+        self.capture_threshold = float(meta['capture_threshold'])
+        self.dedup_cos = float(meta['dedup_cos'])
+        self.enabled = bool(sd['enabled'])
+        arr = np.asarray(sd['vectors'])
+        if arr.size == 0 or arr.shape[0] == 0:
+            self.vectors = []
+        else:
+            self.vectors = [np.asarray(arr[i], dtype=np.float64)
+                            for i in range(arr.shape[0])]
+
+    def clone_for_child(self):
+        """Return a fresh Scars object that shares the same scar
+        directions as this one (deep-copied). Used at spawn time:
+        children inherit their parent's scars structurally, just
+        like they inherit brain weights.
+
+        The child's enabled flag mirrors the parent's. It will be
+        overwritten by evolve.py's _set_scars helper, which
+        propagates the population-wide ablation toggle."""
+        child = Scars(brain_dim=self.brain_dim,
+                      capacity=self.capacity,
+                      capture_threshold=self.capture_threshold,
+                      dedup_cos=self.dedup_cos)
+        child.vectors = [v.copy() for v in self.vectors]
+        child.enabled = bool(self.enabled)
+        return child
+
+
+# ----------------------------------------------------------------------
 #  Bittern — the creature
 # ----------------------------------------------------------------------
 
@@ -920,6 +1198,12 @@ class Bittern:
         self.battery = Battery()
         self.pain = Pain(brain_dim=brain_dim)
         self.painful_memory = PainfulMemory()
+        # Scars are STRUCTURAL, not emotional. They live alongside
+        # brain weights as part of the creature's inherited makeup,
+        # not alongside battery/pain as a felt-state. They survive
+        # reset_emotional_state() and are deep-copied to children at
+        # spawn time.
+        self.scars = Scars(brain_dim=brain_dim)
         self.round = 0
         self.recent_brain_losses = []
 
@@ -997,13 +1281,17 @@ class Bittern:
                 if self_hear_p > 0 and len(prefix) > 1:
                     for t in range(1, len(prefix)):
                         if self.rng.random() < self_hear_p:
-                            probs = self.brain.predict_probs(prefix[:t])
+                            probs = self.brain.predict_probs(
+                                prefix[:t], scars=self.scars)
                             prefix[t] = int(
                                 self.rng.choice(VOCAB_SIZE, p=probs))
 
             # Sting needs PRE-update brain probs (was the brain confident
             # about the wrong answer BEFORE this gradient step?).
-            brain_probs_pre = self.brain.predict_probs(prefix)
+            # These probs come from the PROJECTED bs — they are what
+            # the brain actually emits given existing scars.
+            brain_probs_pre = self.brain.predict_probs(
+                prefix, scars=self.scars)
 
             # Capture into PainfulMemory BEFORE the gradient step. The
             # pair the brain just got confidently wrong on is the
@@ -1013,15 +1301,31 @@ class Bittern:
             self.painful_memory.maybe_capture(prefix, target,
                                               brain_probs_pre)
 
+            # Capture into Scars BEFORE the gradient step too. We use
+            # the UNPROJECTED bs (a fresh encode call — cheap) as the
+            # scar candidate direction, but the PROJECTED probs to
+            # decide whether sting crosses threshold. This means a
+            # scar represents a direction in the natural brain-state
+            # space, not a left-over component in the orthogonal
+            # complement of existing scars.
+            bs_pre_raw, _ = self.brain.encode(prefix)
+            self.scars.maybe_capture(bs_pre_raw, brain_probs_pre,
+                                     target)
+
             # Disquiet adds urgency to the brain's learning rate.
             eff_brain_lr = self.pain.effective_brain_lr(lr)
 
-            loss = self.brain.train_step(prefix, target, lr=eff_brain_lr)
+            loss = self.brain.train_step(prefix, target,
+                                         lr=eff_brain_lr,
+                                         scars=self.scars)
             this_call_losses.append(loss)
             self.recent_brain_losses.append(loss)
 
             # Post-update brain state — what flows to the organs.
-            bs, _ = self.brain.encode(prefix)
+            # Project off the scar subspace before passing to organs,
+            # so organs see exactly what the readout sees.
+            bs_raw, _ = self.brain.encode(prefix)
+            bs = project_off_scars(bs_raw, self.scars)
             last_bs = bs
 
             # Itch: compare body's response WITH lateral vs WITHOUT.
@@ -1083,7 +1387,10 @@ class Bittern:
         for _ in range(n):
             window = context[-eff_context:]
             if mode == 'organs':
-                bs, _ = self.brain.encode(window)
+                bs_raw, _ = self.brain.encode(window)
+                # Project off scar subspace so organs see exactly
+                # what the readout sees.
+                bs = project_off_scars(bs_raw, self.scars)
                 choice, _probs = self.organs.fire(
                     bs, prev, fatigue, emotion, self.rng,
                     temperature_override=eff_temp,
@@ -1092,13 +1399,14 @@ class Bittern:
                 fatigue[choice] += self.organs.fatigue_amount
             elif mode == 'brain_sample':
                 # Brain bypass paths use full base context — pain
-                # doesn't apply to brain-only generation modes.
+                # doesn't apply to brain-only generation modes. Scars
+                # DO apply: they're structural, not behavioral.
                 window = context[-self.brain.context:]
-                probs = self.brain.predict_probs(window)
+                probs = self.brain.predict_probs(window, scars=self.scars)
                 choice = int(self.rng.choice(VOCAB_SIZE, p=probs))
             elif mode == 'brain_argmax':
                 window = context[-self.brain.context:]
-                probs = self.brain.predict_probs(window)
+                probs = self.brain.predict_probs(window, scars=self.scars)
                 choice = int(np.argmax(probs))
             else:
                 raise ValueError(f"unknown babble mode: {mode!r}")
@@ -1127,10 +1435,18 @@ class Bittern:
         so giving surviving parents their old buffer would mean
         selection rewards "did this parent get lucky with their
         buffer" rather than "is this brain a useful inheritance."
-        Within-lifetime memory experiments should not call this."""
+        Within-lifetime memory experiments should not call this.
+
+        SCARS specifically do NOT reset here. They are STRUCTURAL,
+        not emotional — like brain weights, they are inherited
+        across generations (via clone_for_child at spawn time) and
+        survive a parent's transition into the next generation.
+        Resetting scars on a surviving parent would erase the very
+        substrate selection is supposed to be operating on."""
         self.battery = Battery()
         self.pain = Pain(brain_dim=self.brain.brain_dim)
         self.painful_memory = PainfulMemory()
+        # self.scars is intentionally untouched — see docstring.
         self.round = 0
         self.recent_brain_losses = []
 
@@ -1142,6 +1458,7 @@ class Bittern:
         os_dict = self.organs.state_dict()
         bt_dict = self.battery.state_dict()
         p_dict = self.pain.state_dict()
+        sc_dict = self.scars.state_dict()
 
         arrays = {}
         for k, v in bs_dict.items():
@@ -1153,6 +1470,9 @@ class Bittern:
         for k, v in p_dict.items():
             if isinstance(v, np.ndarray):
                 arrays[f'pain__{k}'] = v
+        for k, v in sc_dict.items():
+            if isinstance(v, np.ndarray):
+                arrays[f'scars__{k}'] = v
         np.savez(path + '.npz', **arrays)
 
         meta = {
@@ -1171,6 +1491,8 @@ class Bittern:
                 'ema_initialized': bool(p_dict['ema_initialized']),
             },
             'painful_memory': self.painful_memory.state_dict(),
+            'scars_meta': sc_dict['_meta'],
+            'scars_enabled': bool(sc_dict['enabled']),
         }
         with open(path + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
@@ -1219,9 +1541,27 @@ class Bittern:
             bittern.painful_memory.load_state(meta['painful_memory'])
         # else: bittern.painful_memory was already constructed fresh
 
+        # Scars — backwards compatible with pre-scars saves.
+        if 'scars_meta' in meta:
+            sc_load = {
+                '_meta': meta['scars_meta'],
+                'enabled': meta.get('scars_enabled', True),
+            }
+            for k, v in arrays.items():
+                if k.startswith('scars__'):
+                    sc_load[k[len('scars__'):]] = v
+            # If no vectors array was saved (empty buffer), provide one.
+            if 'vectors' not in sc_load:
+                sc_load['vectors'] = np.zeros(
+                    (0, int(meta['scars_meta']['brain_dim'])))
+            bittern.scars.load_state(sc_load)
+        # else: bittern.scars was already constructed fresh
+
         return bittern
 
 
-__all__ = ['Brain', 'Organs', 'Battery', 'Pain', 'PainfulMemory', 'Bittern',
+__all__ = ['Brain', 'Organs', 'Battery', 'Pain', 'PainfulMemory',
+           'Scars', 'Bittern',
+           'project_off_scars',
            'VOCAB_SIZE', 'DEFAULT_EMBED_DIM', 'DEFAULT_BRAIN_DIM',
            'DEFAULT_CONTEXT']
