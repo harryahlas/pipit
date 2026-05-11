@@ -137,6 +137,26 @@ class Brain:
         self.W_out = self.rng.normal(0, scale, (brain_dim, VOCAB_SIZE))
         self.b_out = np.zeros(VOCAB_SIZE)
 
+        # ── Pain v4 (proprioception) ────────────────────────────────
+        # Learnable embedding for the pain channel. When the brain
+        # encodes a context with a per-position pain stream, each
+        # row of x is shifted by pain[t] * pain_embedding before
+        # attention. The brain then learns, by ordinary gradient
+        # descent, what to do with that signal.
+        #
+        # Initialized small so that early in training, pain values
+        # (which can be noisy) have minimal impact. Initialized LAST
+        # in this method so that adding the parameter does not shift
+        # the RNG state used by the other params — a v3 creature
+        # built with seed S will have IDENTICAL embedding/W_q/.../
+        # b_out as a v4 creature built with seed S, plus an extra
+        # pain_embedding sampled at the end.
+        #
+        # Heritable: included in state_dict, loaded with a
+        # backwards-compat fallback, listed in evolve.BRAIN_PARAMS
+        # so spawn() copies + mutates it like every other weight.
+        self.pain_embedding = self.rng.normal(0, 0.1, embed_dim)
+
         # Pre-compute causal masks (avoids re-allocating every encode call)
         self._causal_masks = {}
         for t in range(2, context + 1):
@@ -162,17 +182,37 @@ class Brain:
 
     # -- forward -------------------------------------------------------
 
-    def encode(self, bits):
-        """Return (brain_state, cache). Empty bits -> zero brain state."""
+    def encode(self, bits, pain=None):
+        """Return (brain_state, cache). Empty bits -> zero brain state.
+
+        pain: None or array-like of shape (len(bits),). Per-position
+            pain values in [0, 1]. When provided, each row of x is
+            shifted by pain[t] * self.pain_embedding before attention.
+            This is the proprioception input pathway for pain v4.
+            None is bit-identical to passing all-zeros.
+        """
         bits = np.asarray(bits, dtype=np.int64)
+        pain_arr = None
+        if pain is not None:
+            pain_arr = np.asarray(pain, dtype=np.float64)
+            if pain_arr.shape != bits.shape:
+                raise ValueError(
+                    f"pain shape {pain_arr.shape} must match "
+                    f"bits shape {bits.shape}")
+
         # Right-truncate to context if needed (matches clade's text_to_idxs)
         if bits.size > self.context:
             bits = bits[-self.context:]
+            if pain_arr is not None:
+                pain_arr = pain_arr[-self.context:]
         T = bits.size
         if T == 0:
             return np.zeros(self.brain_dim), None
 
         x = self.embedding[bits] + self.pos_enc[:T]            # (T, D)
+        if pain_arr is not None:
+            # x[t] += pain[t] * pain_embedding   for all t
+            x = x + pain_arr[:, None] * self.pain_embedding[None, :]
         Q = x @ self.W_q                                       # (T, D)
         K = x @ self.W_k
         V = x @ self.W_v
@@ -188,25 +228,36 @@ class Brain:
 
         cache = {'bits': bits, 'x': x, 'Q': Q, 'K': K, 'V': V,
                  'attn': attn, 'attn_out': attn_out, 'T': T,
-                 'scale': scale}
+                 'scale': scale, 'pain_arr': pain_arr}
         return brain_state, cache
 
-    def predict_probs(self, bits, scars=None):
-        bs, _ = self.encode(bits)
+    def predict_probs(self, bits, scars=None, pain=None):
+        bs, _ = self.encode(bits, pain=pain)
         bs = project_off_scars(bs, scars)
         logits = bs @ self.W_out + self.b_out
         return self._softmax(logits, axis=-1)
 
-    def predict_fast(self, bits, scars=None):
+    def predict_fast(self, bits, scars=None, pain=None):
         """Forward pass without cache — for scoring only.
         Same math as predict_probs but skips cache dict construction."""
         bits = np.asarray(bits, dtype=np.int64)
+        pain_arr = None
+        if pain is not None:
+            pain_arr = np.asarray(pain, dtype=np.float64)
+            if pain_arr.shape != bits.shape:
+                raise ValueError(
+                    f"pain shape {pain_arr.shape} must match "
+                    f"bits shape {bits.shape}")
         if bits.size > self.context:
             bits = bits[-self.context:]
+            if pain_arr is not None:
+                pain_arr = pain_arr[-self.context:]
         T = bits.size
         if T == 0:
             return np.array([0.5, 0.5])
         x = self.embedding[bits] + self.pos_enc[:T]
+        if pain_arr is not None:
+            x = x + pain_arr[:, None] * self.pain_embedding[None, :]
         Q = x @ self.W_q
         K = x @ self.W_k
         V = x @ self.W_v
@@ -222,7 +273,7 @@ class Brain:
 
     # -- training ------------------------------------------------------
 
-    def train_step(self, bits, target_bit, lr=0.01, scars=None):
+    def train_step(self, bits, target_bit, lr=0.01, scars=None, pain=None):
         """One forward+backward step. Returns CE loss.
 
         With scars: project bs onto the orthogonal complement of the
@@ -230,10 +281,17 @@ class Brain:
         way before flowing back into W_o. The projector is symmetric,
         so forward and backward use the same helper.
 
-        With scars=None / disabled / empty buffer: bit-identical to
-        the no-scars implementation.
+        With pain (proprioception): pain[t] * pain_embedding is added
+        to row t of x in the forward pass; on the backward pass,
+        d_pain_embedding = sum_t pain[t] * d_x[t] is computed and
+        the parameter is updated. With pain=None or pain all-zeros,
+        d_pain_embedding is zero and pain_embedding stays at its
+        current value — bit-identical to a no-mechanism path.
+
+        With scars=None / disabled / empty buffer AND pain=None:
+        bit-identical to the no-mechanism implementation.
         """
-        bs, cache = self.encode(bits)
+        bs, cache = self.encode(bits, pain=pain)
         if cache is None:
             return 0.0
 
@@ -285,9 +343,17 @@ class Brain:
                + d_K @ self.W_k.T
                + d_V @ self.W_v.T)                             # (T, D)
 
-        # x = embedding[bits] + pos_enc -> scatter d_x into embedding
+        # x = embedding[bits] + pos_enc + pain[:, None] * pain_embedding[None, :]
+        # -> scatter d_x into embedding
         d_embedding = np.zeros_like(self.embedding)
         np.add.at(d_embedding, cache['bits'], d_x)
+
+        # -> sum into pain_embedding (only if pain was provided)
+        # d_pain_embedding[d] = sum_t pain[t] * d_x[t, d]
+        pain_arr = cache.get('pain_arr')
+        d_pain_embedding = None
+        if pain_arr is not None:
+            d_pain_embedding = pain_arr @ d_x                  # (D,)
 
         # ----- apply -----
         self.W_out -= lr * d_W_out
@@ -297,6 +363,8 @@ class Brain:
         self.W_k -= lr * d_W_k
         self.W_v -= lr * d_W_v
         self.embedding -= lr * d_embedding
+        if d_pain_embedding is not None:
+            self.pain_embedding -= lr * d_pain_embedding
 
         return float(loss)
 
@@ -311,6 +379,7 @@ class Brain:
             'W_q': self.W_q, 'W_k': self.W_k, 'W_v': self.W_v,
             'W_o': self.W_o,
             'W_out': self.W_out, 'b_out': self.b_out,
+            'pain_embedding': self.pain_embedding,
         }
 
     def load_state(self, sd):
@@ -327,6 +396,12 @@ class Brain:
         self.W_q, self.W_k, self.W_v = sd['W_q'], sd['W_k'], sd['W_v']
         self.W_o = sd['W_o']
         self.W_out, self.b_out = sd['W_out'], sd['b_out']
+        # Backwards compatible with pre-proprioception saves: keep the
+        # freshly-initialized pain_embedding if the saved blob doesn't
+        # have one.
+        if 'pain_embedding' in sd:
+            self.pain_embedding = np.asarray(sd['pain_embedding'],
+                                             dtype=np.float64)
 
 
 # ----------------------------------------------------------------------
@@ -1017,15 +1092,29 @@ class Scars:
     DEFAULT_CAPACITY = 4
     DEFAULT_CAPTURE_THRESHOLD = 0.5
     DEFAULT_DEDUP_COS = 0.9
+    DEFAULT_WARMUP = 1000
 
     def __init__(self, brain_dim,
                  capacity=DEFAULT_CAPACITY,
                  capture_threshold=DEFAULT_CAPTURE_THRESHOLD,
-                 dedup_cos=DEFAULT_DEDUP_COS):
+                 dedup_cos=DEFAULT_DEDUP_COS,
+                 warmup=DEFAULT_WARMUP):
         self.brain_dim = int(brain_dim)
         self.capacity = int(capacity)
         self.capture_threshold = float(capture_threshold)
         self.dedup_cos = float(dedup_cos)
+        # Warmup: first N rounds of each creature's life, capture is
+        # disabled. The previous v3 ablation diagnosed scars filling
+        # during the brain's noisy initialization phase, anchoring
+        # the mechanism to ignorance rather than to learned failure.
+        # Warmup gates capture until the brain has had a chance to
+        # learn something worth scarring around. Note: this is a
+        # PER-LIFE gate keyed on Bittern.round, which resets in
+        # reset_emotional_state(). A surviving parent re-enters
+        # warmup when crossing a generational boundary — they keep
+        # their existing scars (those still apply via projection)
+        # but can't add new ones for another warmup window.
+        self.warmup = int(warmup)
         self.vectors = []   # list of np.ndarray, each shape (brain_dim,)
                             # FIFO order: vectors[0] is oldest.
         # Master toggle. With enabled=False, project_off_scars short-
@@ -1035,7 +1124,8 @@ class Scars:
 
     # ── Capture ──────────────────────────────────────────────────────
 
-    def maybe_capture(self, brain_state, brain_probs, target_bit):
+    def maybe_capture(self, brain_state, brain_probs, target_bit,
+                      round_=0):
         """If the brain was confidently wrong, store a scar.
 
         brain_state: the UNPROJECTED bs at this moment. It will be
@@ -1049,12 +1139,16 @@ class Scars:
             since that's what passes through W_out). Used to
             compute sting.
         target_bit: the correct bit.
+        round_: the creature's current round counter. If less than
+            self.warmup, capture is suppressed regardless of sting.
 
         Returns True if a scar was captured (or merged into an
         existing one), False otherwise. Return value is for
         diagnostics; callers can ignore it.
         """
         if not self.enabled:
+            return False
+        if round_ < self.warmup:
             return False
 
         confidence = float(np.max(brain_probs))
@@ -1129,7 +1223,8 @@ class Scars:
             '_meta': {'brain_dim': self.brain_dim,
                       'capacity': self.capacity,
                       'capture_threshold': self.capture_threshold,
-                      'dedup_cos': self.dedup_cos},
+                      'dedup_cos': self.dedup_cos,
+                      'warmup': self.warmup},
             'enabled': bool(self.enabled),
             'vectors': (np.stack(self.vectors, axis=0)
                         if self.vectors
@@ -1145,6 +1240,8 @@ class Scars:
         self.capacity = int(meta['capacity'])
         self.capture_threshold = float(meta['capture_threshold'])
         self.dedup_cos = float(meta['dedup_cos'])
+        # Backwards compatible with pre-warmup saves.
+        self.warmup = int(meta.get('warmup', 0))
         self.enabled = bool(sd['enabled'])
         arr = np.asarray(sd['vectors'])
         if arr.size == 0 or arr.shape[0] == 0:
@@ -1161,14 +1258,192 @@ class Scars:
 
         The child's enabled flag mirrors the parent's. It will be
         overwritten by evolve.py's _set_scars helper, which
-        propagates the population-wide ablation toggle."""
+        propagates the population-wide ablation toggle.
+
+        Warmup is also inherited — same fixed parameter across the
+        lineage. The child's round counter starts at 0 (fresh life),
+        so the child re-enters the warmup window even though it
+        starts with parent scars already projected."""
         child = Scars(brain_dim=self.brain_dim,
                       capacity=self.capacity,
                       capture_threshold=self.capture_threshold,
-                      dedup_cos=self.dedup_cos)
+                      dedup_cos=self.dedup_cos,
+                      warmup=self.warmup)
         child.vectors = [v.copy() for v in self.vectors]
         child.enabled = bool(self.enabled)
         return child
+
+
+# ----------------------------------------------------------------------
+#  Proprioception — pain v4, the felt channel
+# ----------------------------------------------------------------------
+
+class Proprioception:
+    """A per-call pain stream the brain reads as additional input.
+
+    The theory (full version in bittern-pain-v4-handoff.md): pain
+    is a sense the creature has of its own predictive state, fed
+    back through the same pathway it uses to read the world.
+    Concretely: each bit position in the recent context can carry
+    a scalar pain value in [0, 1]; when the brain encodes that
+    context, each row of the input matrix is shifted in the
+    direction of `Brain.pain_embedding` by an amount proportional
+    to that position's pain. The brain learns by gradient descent
+    what to do with that shift.
+
+    Why this avoids the v1/v2/v3 failure modes:
+
+    v1 had no heritable substrate — pain modulated knobs but
+    didn't accrete into a parameter selection could act on.
+    v4 has `Brain.pain_embedding`, a brain weight that mutates
+    and inherits like W_q.
+
+    v2 stored stale (prefix, target) gradient targets. v4 doesn't
+    replay anything — pain values are computed online from the
+    current brain's predictions, used immediately, then forgotten
+    when the listen() call ends. Persistence-of-meaning lives in
+    the parameter, not in the values.
+
+    v3 carved out brain-state subspaces forever via symmetric
+    forward+backward projection, and was anchored to ignorance
+    because early scars formed during the brain's noisy phase.
+    v4 doesn't constrain the brain at all — pain is just an
+    input. The brain remains free to drive pain_embedding small,
+    learn to project pain's effect away, or use it constructively.
+    Noisy early pain values just mean small input perturbations
+    that the brain can adapt around.
+
+    --- What this class owns ---
+
+    A small dict `pain_by_pos` mapping bit positions (within the
+    current listen() call's `bits` array) to scalar pain values.
+    Per-call: cleared at the start of each listen(), populated as
+    train_pair iterations record stings, queried by subsequent
+    iterations whose prefixes overlap previously-predicted
+    positions. Across-call persistence is intentionally NOT
+    provided — bit position 17 in call A doesn't refer to the same
+    thing as bit position 17 in call B, since the world hands a
+    fresh utterance each call.
+
+    The PERSISTENT thing in pain v4 is `Brain.pain_embedding`.
+    This class only owns the transient stream. The class does NOT
+    hold pain_embedding because pain_embedding is a brain weight
+    (mutated by spawn(), saved/loaded with the brain, etc.).
+
+    --- Master toggle ---
+
+    `enabled` False -> get_pain_for_prefix returns None (caller
+    passes pain=None to brain methods, no pain term added),
+    maybe_record is a no-op. Mirrors the toggle pattern used by
+    Pain, PainfulMemory, and Scars.
+
+    --- record_threshold ---
+
+    Default 0.0: every prediction event records pain (= sting). A
+    higher threshold sparsifies the record to confident-wrong
+    moments only. Used in unit tests by setting threshold > 1.0
+    to ensure no records form, which makes enabled-mode bit-
+    identical to disabled-mode.
+    """
+
+    DEFAULT_RECORD_THRESHOLD = 0.0
+
+    def __init__(self, record_threshold=DEFAULT_RECORD_THRESHOLD):
+        self.record_threshold = float(record_threshold)
+        # Per-call pain dict: bit-position -> sting in [0, 1].
+        # Resets on reset_pain_for_call().
+        self.pain_by_pos = {}
+        # Master toggle for ablation. Mirror of pain.enabled,
+        # painful_memory.enabled, scars.enabled.
+        self.enabled = True
+
+    # ── Pain stream ──────────────────────────────────────────────────
+
+    def reset_pain_for_call(self):
+        """Clear the per-call pain dict. Called at the start of each
+        Bittern.listen() call. Pain values from one listen() do not
+        carry into the next — bit positions don't share meaning
+        across calls."""
+        self.pain_by_pos = {}
+
+    def maybe_record(self, position, sting):
+        """Record pain for a predicted bit position. Called after
+        each train_pair where we have brain_probs_pre and a target.
+
+        sting: max_prob × (1 − prob_of_target). In [0, 1].
+        position: index into the current call's `bits` array of
+            the bit that was being predicted.
+
+        With enabled=False or sting<record_threshold: no-op."""
+        if not self.enabled:
+            return
+        if sting < self.record_threshold:
+            return
+        self.pain_by_pos[int(position)] = float(sting)
+
+    def get_pain_for_prefix(self, start, end):
+        """Return pain values for positions [start, end), aligned
+        with bits[start:end]. Returns:
+
+            None    — if disabled, OR end<=start. Caller should pass
+                      pain=None to brain methods, skipping the pain
+                      term entirely.
+            ndarray — shape (end-start,), with 0.0 in slots where
+                      no pain has been recorded yet for that position.
+
+        Returning None for disabled means disabled-mode is bit-
+        identical to a creature with no Proprioception class at all
+        (no pain term added in encode, no gradient on pain_embedding
+        in train_step)."""
+        if not self.enabled:
+            return None
+        n = int(end) - int(start)
+        if n <= 0:
+            return None
+        out = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            v = self.pain_by_pos.get(int(start) + i)
+            if v is not None:
+                out[i] = v
+        return out
+
+    # ── Reporting ────────────────────────────────────────────────────
+
+    def report(self):
+        """Snapshot of current per-call pain dict."""
+        if not self.pain_by_pos:
+            return {
+                'size': 0, 'mean': 0.0, 'max': 0.0,
+                'enabled': bool(self.enabled),
+            }
+        vals = list(self.pain_by_pos.values())
+        return {
+            'size': len(vals),
+            'mean': float(np.mean(vals)),
+            'max': float(np.max(vals)),
+            'enabled': bool(self.enabled),
+        }
+
+    # ── Persistence ──────────────────────────────────────────────────
+    #
+    # Because pain_by_pos is per-call (cleared at the start of every
+    # listen()), there is no meaningful long-term state to save in
+    # this class — the persistent thing is Brain.pain_embedding,
+    # which is saved with the brain. We still write a tiny dict so
+    # the toggle and threshold are preserved across save/load.
+
+    def state_dict(self):
+        return {
+            'enabled': bool(self.enabled),
+            'record_threshold': float(self.record_threshold),
+        }
+
+    def load_state(self, sd):
+        self.enabled = bool(sd.get('enabled', True))
+        self.record_threshold = float(sd.get('record_threshold',
+                                             self.DEFAULT_RECORD_THRESHOLD))
+        # pain_by_pos is intentionally not loaded — it's per-call
+        # transient. Stays at the freshly-initialized {} from __init__.
 
 
 # ----------------------------------------------------------------------
@@ -1204,6 +1479,12 @@ class Bittern:
         # reset_emotional_state() and are deep-copied to children at
         # spawn time.
         self.scars = Scars(brain_dim=brain_dim)
+        # Proprioception (pain v4): per-call pain stream that the
+        # brain reads via Brain.pain_embedding. The class itself
+        # holds only transient state (cleared each listen() call);
+        # the persistent, heritable substance is pain_embedding,
+        # which lives in self.brain and is mutated/copied by spawn().
+        self.proprioception = Proprioception()
         self.round = 0
         self.recent_brain_losses = []
 
@@ -1250,6 +1531,13 @@ class Bittern:
         eff_context = self.pain.effective_context(
             self.brain.context, self.recent_brain_losses, self.round)
 
+        # Pain v4: clear the per-call pain dict at the start of
+        # every listen(). Pain values from one call do not carry
+        # into the next — bit positions don't share meaning across
+        # calls (the world hands a fresh utterance each time).
+        # Persistent learning lives in Brain.pain_embedding, not here.
+        self.proprioception.reset_pain_for_call()
+
         last_bs = None             # for update_after_listen
         this_call_losses = []      # for disquiet
 
@@ -1257,6 +1545,12 @@ class Bittern:
             # Replay or fresh? PainfulMemory may return a past pair
             # to retrain on; otherwise we draw from the current world.
             replay = self.painful_memory.maybe_replay(self.rng)
+            # Track whether this iteration is a replay or world-fresh.
+            # Pain stream applies only to world-fresh iterations:
+            # replay prefixes have no positional meaning in the
+            # current `bits`, so there's no pain dict to query.
+            pair_split = None
+            pain_for_prefix = None
             if replay is not None:
                 prefix, target = replay
                 # Truncate to current effective context for consistency
@@ -1274,6 +1568,7 @@ class Bittern:
                 start = max(0, split - eff_context)
                 prefix = list(bits[start:split])
                 target = int(bits[split])
+                pair_split = split
 
                 # Self-hearing: replace some prefix bits with brain's own
                 # predictions. Scheduled sampling. Only applied to
@@ -1286,12 +1581,20 @@ class Bittern:
                             prefix[t] = int(
                                 self.rng.choice(VOCAB_SIZE, p=probs))
 
+                # Pain stream for this prefix: pull recorded sting
+                # values from earlier train_pairs in this same
+                # listen() call. Most slots are 0 unless an earlier
+                # iteration scored a position in [start, split).
+                pain_for_prefix = self.proprioception.get_pain_for_prefix(
+                    start, split)
+
             # Sting needs PRE-update brain probs (was the brain confident
             # about the wrong answer BEFORE this gradient step?).
             # These probs come from the PROJECTED bs — they are what
-            # the brain actually emits given existing scars.
+            # the brain actually emits given existing scars. They
+            # also reflect the pain channel for this prefix.
             brain_probs_pre = self.brain.predict_probs(
-                prefix, scars=self.scars)
+                prefix, scars=self.scars, pain=pain_for_prefix)
 
             # Capture into PainfulMemory BEFORE the gradient step. The
             # pair the brain just got confidently wrong on is the
@@ -1304,27 +1607,44 @@ class Bittern:
             # Capture into Scars BEFORE the gradient step too. We use
             # the UNPROJECTED bs (a fresh encode call — cheap) as the
             # scar candidate direction, but the PROJECTED probs to
-            # decide whether sting crosses threshold. This means a
-            # scar represents a direction in the natural brain-state
-            # space, not a left-over component in the orthogonal
-            # complement of existing scars.
-            bs_pre_raw, _ = self.brain.encode(prefix)
+            # decide whether sting crosses threshold. Pain is passed
+            # so the encoded direction reflects what the brain
+            # actually used for its prediction.
+            #
+            # Also gated by self.round < scars.warmup — capture is
+            # suppressed during the early-noisy phase to keep scars
+            # from being anchored to initialization randomness.
+            bs_pre_raw, _ = self.brain.encode(prefix, pain=pain_for_prefix)
             self.scars.maybe_capture(bs_pre_raw, brain_probs_pre,
-                                     target)
+                                     target, round_=self.round)
 
             # Disquiet adds urgency to the brain's learning rate.
             eff_brain_lr = self.pain.effective_brain_lr(lr)
 
             loss = self.brain.train_step(prefix, target,
                                          lr=eff_brain_lr,
-                                         scars=self.scars)
+                                         scars=self.scars,
+                                         pain=pain_for_prefix)
             this_call_losses.append(loss)
             self.recent_brain_losses.append(loss)
 
+            # Pain v4: record the pain felt on THIS prediction event
+            # so subsequent train_pairs (whose prefixes may overlap)
+            # can read it. Recorded only for world-fresh pairs;
+            # replays don't have a position in the current bits.
+            # Recorded AFTER train_step so the value is the pre-update
+            # sting (which was already computed via brain_probs_pre)
+            # but applied at the position whose prediction it scores.
+            if pair_split is not None:
+                sting = (float(np.max(brain_probs_pre))
+                         * float(1.0 - brain_probs_pre[int(target)]))
+                self.proprioception.maybe_record(pair_split, sting)
+
             # Post-update brain state — what flows to the organs.
             # Project off the scar subspace before passing to organs,
-            # so organs see exactly what the readout sees.
-            bs_raw, _ = self.brain.encode(prefix)
+            # so organs see exactly what the readout sees. Pain is
+            # passed for consistency with predict_probs above.
+            bs_raw, _ = self.brain.encode(prefix, pain=pain_for_prefix)
             bs = project_off_scars(bs_raw, self.scars)
             last_bs = bs
 
@@ -1358,13 +1678,21 @@ class Bittern:
 
         self.round += 1
 
-    def babble(self, prompt_bits, n=32, mode='organs'):
+    def babble(self, prompt_bits, n=32, mode='organs', induced_pain=None):
         """Given a prompt, generate n bits.
 
         modes:
             'organs'       - normal path, organs decide each bit
             'brain_sample' - bypass organs, sample from brain.predict_probs
             'brain_argmax' - bypass organs, take brain's most likely bit
+
+        induced_pain: None (default) or float in [0, 1]. The pain v4
+            probe knob. With None, the pain channel is 0 throughout
+            babble (the creature operates in its "no-discomfort"
+            mode). With a float, the pain channel is held at that
+            value across the entire window for diagnostic comparison
+            of calm-vs-pained babble. Only consulted when
+            self.proprioception.enabled.
 
         --- Pain interactions (organs mode only) ---
         Hunger shortens window. Sting raises temperature. Nausea
@@ -1384,10 +1712,25 @@ class Bittern:
         eff_lat = self.pain.effective_lateral_weight(
             self.organs.lateral_weight)
 
+        # Pre-compute whether pain v4 is active for this babble.
+        # induced_pain has no effect when proprioception is disabled
+        # (the toggle takes precedence over the probe knob).
+        use_induced = (induced_pain is not None
+                       and self.proprioception.enabled)
+
         for _ in range(n):
             window = context[-eff_context:]
+            # Pain stream for this window. None = no pain term.
+            # An array filled with induced_pain = sustained pain probe.
+            if use_induced and len(window) > 0:
+                pain_for_window = np.full(len(window),
+                                          float(induced_pain),
+                                          dtype=np.float64)
+            else:
+                pain_for_window = None
+
             if mode == 'organs':
-                bs_raw, _ = self.brain.encode(window)
+                bs_raw, _ = self.brain.encode(window, pain=pain_for_window)
                 # Project off scar subspace so organs see exactly
                 # what the readout sees.
                 bs = project_off_scars(bs_raw, self.scars)
@@ -1401,12 +1744,28 @@ class Bittern:
                 # Brain bypass paths use full base context — pain
                 # doesn't apply to brain-only generation modes. Scars
                 # DO apply: they're structural, not behavioral.
+                # (Pain v4 DOES apply here — it flows through encode
+                # into brain.predict_probs naturally.)
                 window = context[-self.brain.context:]
-                probs = self.brain.predict_probs(window, scars=self.scars)
+                if use_induced and len(window) > 0:
+                    pain_for_window = np.full(len(window),
+                                              float(induced_pain),
+                                              dtype=np.float64)
+                else:
+                    pain_for_window = None
+                probs = self.brain.predict_probs(window, scars=self.scars,
+                                                 pain=pain_for_window)
                 choice = int(self.rng.choice(VOCAB_SIZE, p=probs))
             elif mode == 'brain_argmax':
                 window = context[-self.brain.context:]
-                probs = self.brain.predict_probs(window, scars=self.scars)
+                if use_induced and len(window) > 0:
+                    pain_for_window = np.full(len(window),
+                                              float(induced_pain),
+                                              dtype=np.float64)
+                else:
+                    pain_for_window = None
+                probs = self.brain.predict_probs(window, scars=self.scars,
+                                                 pain=pain_for_window)
                 choice = int(np.argmax(probs))
             else:
                 raise ValueError(f"unknown babble mode: {mode!r}")
@@ -1420,8 +1779,8 @@ class Bittern:
         self.battery.decay()
 
     def reset_emotional_state(self):
-        """Reset battery, pain, painful memory, round counter, and
-        recent loss buffer.
+        """Reset battery, pain, painful memory, proprioception,
+        round counter, and recent loss buffer.
 
         Used when a creature crosses a generational boundary (in
         evolve.py): the brain weights persist, but the felt-state of
@@ -1437,6 +1796,15 @@ class Bittern:
         buffer" rather than "is this brain a useful inheritance."
         Within-lifetime memory experiments should not call this.
 
+        Proprioception's per-call pain dict is reset for the same
+        reason it's reset at the start of every listen(): bit
+        positions don't carry meaning across utterances. The toggle
+        and threshold are preserved (these aren't felt-state).
+        Note that Brain.pain_embedding (the HERITABLE substance of
+        pain v4) is NOT touched — it lives in self.brain and
+        persists across generations like W_q. Resetting it would
+        erase the substrate selection acts on.
+
         SCARS specifically do NOT reset here. They are STRUCTURAL,
         not emotional — like brain weights, they are inherited
         across generations (via clone_for_child at spawn time) and
@@ -1446,6 +1814,10 @@ class Bittern:
         self.battery = Battery()
         self.pain = Pain(brain_dim=self.brain.brain_dim)
         self.painful_memory = PainfulMemory()
+        # Preserve proprioception's toggle + threshold across the
+        # reset; only the transient per-call dict gets cleared.
+        # (Brain.pain_embedding is untouched — it's heritable.)
+        self.proprioception.reset_pain_for_call()
         # self.scars is intentionally untouched — see docstring.
         self.round = 0
         self.recent_brain_losses = []
@@ -1459,6 +1831,7 @@ class Bittern:
         bt_dict = self.battery.state_dict()
         p_dict = self.pain.state_dict()
         sc_dict = self.scars.state_dict()
+        pr_dict = self.proprioception.state_dict()
 
         arrays = {}
         for k, v in bs_dict.items():
@@ -1493,6 +1866,12 @@ class Bittern:
             'painful_memory': self.painful_memory.state_dict(),
             'scars_meta': sc_dict['_meta'],
             'scars_enabled': bool(sc_dict['enabled']),
+            # Proprioception state. The per-call pain dict is not
+            # saved (it's transient); only the toggle + threshold
+            # are preserved. The persistent, heritable substance of
+            # pain v4 — Brain.pain_embedding — is saved with the
+            # brain blob above (as brain__pain_embedding).
+            'proprioception': pr_dict,
         }
         with open(path + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
@@ -1557,11 +1936,23 @@ class Bittern:
             bittern.scars.load_state(sc_load)
         # else: bittern.scars was already constructed fresh
 
+        # Proprioception — backwards compatible with pre-v4 saves.
+        # If the save predates pain v4, the freshly-constructed
+        # Proprioception (created in Bittern.__init__) stays. Note
+        # that the brain blob may still contain a pain_embedding
+        # in that case (if it was saved by a v4 brain) — that gets
+        # loaded above via brain.load_state. A truly pre-v4 brain
+        # blob has no pain_embedding key and keeps the freshly-
+        # initialized one.
+        if 'proprioception' in meta:
+            bittern.proprioception.load_state(meta['proprioception'])
+        # else: bittern.proprioception was already constructed fresh
+
         return bittern
 
 
 __all__ = ['Brain', 'Organs', 'Battery', 'Pain', 'PainfulMemory',
-           'Scars', 'Bittern',
+           'Scars', 'Proprioception', 'Bittern',
            'project_off_scars',
            'VOCAB_SIZE', 'DEFAULT_EMBED_DIM', 'DEFAULT_BRAIN_DIM',
            'DEFAULT_CONTEXT']

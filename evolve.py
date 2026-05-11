@@ -20,6 +20,7 @@ design, no hyperparameter tuning mid-run. Whatever wins, wins.
     python evolve.py --pop 12 --generations 15    # bigger tournament
     python evolve.py --rounds 8000 --sigma 0.03   # tune pressure
     python evolve.py --no-pain                    # ablation: pain disabled
+    python evolve.py --no-proprioception          # ablation: pain v4 disabled
 
 Architecture:
 
@@ -88,7 +89,14 @@ GEN_PREFIX = [
 
 # ── Reproduction ─────────────────────────────────────────────────────
 
-BRAIN_PARAMS = ['embedding', 'W_q', 'W_k', 'W_v', 'W_o', 'W_out', 'b_out']
+# Brain parameters that get cloned + mutated when a parent spawns a
+# child. `pain_embedding` (pain v4 / proprioception) is included here
+# so that the brain's learned translation of pain → representations
+# is heritable, the same way W_q is. With proprioception disabled
+# across an entire run, this parameter is mutated but never used in
+# computation, which is harmless.
+BRAIN_PARAMS = ['embedding', 'W_q', 'W_k', 'W_v', 'W_o', 'W_out', 'b_out',
+                'pain_embedding']
 
 
 def spawn(parent, child_name, sigma=0.02, rng=None):
@@ -145,6 +153,18 @@ def _set_scars(c, enabled):
     you can ablate a creature mid-experiment without destroying its
     accumulated scars."""
     c.scars.enabled = bool(enabled)
+
+
+def _set_proprioception(c, enabled):
+    """Helper: flip the proprioception (pain v4) master toggle.
+
+    With enabled=False, Proprioception.get_pain_for_prefix returns
+    None — Bittern.listen passes pain=None to brain methods, no
+    pain term enters encode, no gradient flows to pain_embedding.
+    The Brain.pain_embedding parameter is still present and still
+    mutated by spawn() (harmlessly, since it's unused) so a single
+    seed produces an identical creature regardless of toggle."""
+    c.proprioception.enabled = bool(enabled)
 
 
 # ── Competitive habitat (one generation) ─────────────────────────────
@@ -260,8 +280,21 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
            seed=0, sigma=0.02, lr=0.02, block_size=20, out='babies',
            names=None, champion_name='champion',
            pain_enabled=True, replay_enabled=True,
-           scars_enabled=True):
-    """Run the tournament."""
+           scars_enabled=True, scar_warmup=None,
+           propio_enabled=True):
+    """Run the tournament.
+
+    scar_warmup: if not None, override every creature's
+        scars.warmup with this value. None leaves the Scars
+        default (1000) in place. Set to 0 to reproduce the
+        original v3 (no warmup).
+
+    propio_enabled: pain v4 (proprioception) master toggle. When
+        False, the brain receives pain=None everywhere — no pain
+        term enters encode, no gradient flows to pain_embedding.
+        The pain_embedding parameter is still mutated by spawn()
+        regardless, but it's unused when the toggle is off.
+    """
     rng = np.random.default_rng(seed)
 
     # Build corpora once (shared across all generations)
@@ -269,13 +302,22 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     train_corpus = make_corpus(per_class=200, length=64, rng=corpus_rng)
     eval_corpus = make_corpus(per_class=20, length=64, rng=corpus_rng)
 
+    def _apply_warmup(c):
+        if scar_warmup is not None:
+            c.scars.warmup = int(scar_warmup)
+
     # Generation 0: all born naive
     print(f"\n{'='*65}")
     print(f"  EVOLUTION — {pop_size} creatures, {generations} generations")
     print(f"  {rounds_per_gen} rounds/gen, sigma={sigma}, block={block_size}")
-    print(f"  pain:   {'ON' if pain_enabled else 'OFF (ablation)'}")
-    print(f"  replay: {'ON' if replay_enabled else 'OFF (ablation)'}")
-    print(f"  scars:  {'ON' if scars_enabled else 'OFF (ablation)'}")
+    print(f"  pain:           {'ON' if pain_enabled else 'OFF (ablation)'}")
+    print(f"  replay:         {'ON' if replay_enabled else 'OFF (ablation)'}")
+    if scars_enabled:
+        wm = scar_warmup if scar_warmup is not None else 'default(1000)'
+        print(f"  scars:          ON  (warmup={wm})")
+    else:
+        print(f"  scars:          OFF (ablation)")
+    print(f"  proprioception: {'ON' if propio_enabled else 'OFF (ablation)'}")
     print(f"{'='*65}")
 
     creatures = []
@@ -286,6 +328,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
         _set_pain(c, pain_enabled)
         _set_replay(c, replay_enabled)
         _set_scars(c, scars_enabled)
+        _set_proprioception(c, propio_enabled)
+        _apply_warmup(c)
         creatures.append(c)
 
     champion_history = []
@@ -380,6 +424,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
                 _set_pain(parent, pain_enabled)
                 _set_replay(parent, replay_enabled)
                 _set_scars(parent, scars_enabled)
+                _set_proprioception(parent, propio_enabled)
+                _apply_warmup(parent)
                 next_gen.append(parent)
 
                 # One child per parent. spawn() copies the parent's
@@ -390,6 +436,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
                 _set_pain(child, pain_enabled)
                 _set_replay(child, replay_enabled)
                 _set_scars(child, scars_enabled)
+                _set_proprioception(child, propio_enabled)
+                _apply_warmup(child)
                 next_gen.append(child)
                 inh = len(child.scars.vectors)
                 print(f"    {parent.name} → {child.name} "
@@ -400,9 +448,10 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     # Final summary
     print(f"\n{'='*65}")
     print(f"  EVOLUTION COMPLETE — champion trajectory")
-    print(f"  pain:   {'ON' if pain_enabled else 'OFF (ablation)'}")
-    print(f"  replay: {'ON' if replay_enabled else 'OFF (ablation)'}")
-    print(f"  scars:  {'ON' if scars_enabled else 'OFF (ablation)'}")
+    print(f"  pain:           {'ON' if pain_enabled else 'OFF (ablation)'}")
+    print(f"  replay:         {'ON' if replay_enabled else 'OFF (ablation)'}")
+    print(f"  scars:          {'ON' if scars_enabled else 'OFF (ablation)'}")
+    print(f"  proprioception: {'ON' if propio_enabled else 'OFF (ablation)'}")
     print(f"{'='*65}")
     for h in champion_history:
         pc = h['per_class']
@@ -418,6 +467,23 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     # Final scar report
     print(f"\n  final champion scars: {final_champ.scars.report()}")
 
+    # Pain v4 probe: compare calm vs sustained-pain babble on the
+    # champion. If proprioception is off, this just produces two
+    # identical babbles — diagnostic in itself.
+    if propio_enabled:
+        print(f"\n  pain v4 probe — calm vs sustained-pain babble:")
+        for p in PROBE_PROMPTS:
+            calm = final_champ.babble(p['bits'], n=24, induced_pain=None)
+            pained = final_champ.babble(p['bits'], n=24, induced_pain=0.7)
+            print(f"    {p['class']:10s}  {bits_to_str(p['bits'])}")
+            print(f"      calm    → {bits_to_str(calm)}")
+            print(f"      pained  → {bits_to_str(pained)}")
+        # Norm of pain_embedding tells us whether the brain put any
+        # learning into the pain channel at all.
+        pe_norm = float(np.linalg.norm(final_champ.brain.pain_embedding))
+        print(f"  pain_embedding norm: {pe_norm:.4f} "
+              f"(init ≈ {0.1 * np.sqrt(final_champ.brain.embed_dim):.4f})")
+
     # Compare to a loner trained for the same total rounds
     total_rounds = rounds_per_gen * generations
     print(f"\n  control: loner trained {total_rounds} rounds (no competition)")
@@ -425,6 +491,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     _set_pain(loner, pain_enabled)
     _set_replay(loner, replay_enabled)
     _set_scars(loner, scars_enabled)
+    _set_proprioception(loner, propio_enabled)
+    _apply_warmup(loner)
     for r in range(total_rounds):
         item = train_corpus[r % len(train_corpus)]
         loner.listen(item['bits'], train_pairs=4, lr=lr)
@@ -464,6 +532,13 @@ def main():
                    help='disable the painful-memory replay buffer (ablation control)')
     p.add_argument('--no-scars', action='store_true',
                    help='disable the scar system entirely (ablation control)')
+    p.add_argument('--scar-warmup', type=int, default=None,
+                   help='rounds before scar capture is enabled '
+                        '(default: 1000; set to 0 to reproduce '
+                        'original v3)')
+    p.add_argument('--no-proprioception', action='store_true',
+                   help='disable the pain v4 (proprioception) channel '
+                        '(ablation control)')
     args = p.parse_args()
 
     name_list = args.names.split(',') if args.names else None
@@ -474,7 +549,9 @@ def main():
            out=args.out, names=name_list, champion_name=args.champion,
            pain_enabled=not args.no_pain,
            replay_enabled=not args.no_replay,
-           scars_enabled=not args.no_scars)
+           scars_enabled=not args.no_scars,
+           scar_warmup=args.scar_warmup,
+           propio_enabled=not args.no_proprioception)
 
 
 if __name__ == '__main__':

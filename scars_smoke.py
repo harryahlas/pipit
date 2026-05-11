@@ -232,6 +232,7 @@ def test_disabled_bit_identical():
 
     c = Bittern(name='C', seed=123, embed_dim=8, brain_dim=8, context=8)
     c.scars.enabled = True
+    c.scars.warmup = 0   # capture immediately, so 50 rounds is enough
 
     # Run the same listen schedule on all three
     for r in range(50):
@@ -356,7 +357,7 @@ def test_capture_dedup_capacity():
     REPORT.section("capture / dedup / capacity")
 
     # 4a: sting threshold — below 0.5 should not capture
-    sc = Scars(brain_dim=4, capacity=4)
+    sc = Scars(brain_dim=4, capacity=4, warmup=0)
     bs = np.array([1.0, 0.0, 0.0, 0.0])
     # confidence 0.6, target was correct → wrongness 0.4 → sting 0.24
     probs = np.array([0.6, 0.4])
@@ -401,7 +402,7 @@ def test_capture_dedup_capacity():
                  f"buffer size = {len(sc.vectors)}")
 
     # 4e: capacity — fill to cap, then one more, oldest is evicted
-    sc2 = Scars(brain_dim=4, capacity=3, capture_threshold=0.5)
+    sc2 = Scars(brain_dim=4, capacity=3, capture_threshold=0.5, warmup=0)
     eye = np.eye(4)
     high_sting = np.array([0.95, 0.05])
     for i in range(3):
@@ -419,11 +420,26 @@ def test_capture_dedup_capacity():
                  np.allclose(sc2.vectors[-1], eye[3]))
 
     # 4f: disabled scar object never captures
-    sc3 = Scars(brain_dim=4, capacity=4)
+    sc3 = Scars(brain_dim=4, capacity=4, warmup=0)
     sc3.enabled = False
     captured = sc3.maybe_capture(eye[0], np.array([0.95, 0.05]), target_bit=1)
     REPORT.check("disabled Scars.maybe_capture is a no-op",
                  not captured and len(sc3.vectors) == 0)
+
+    # 4g: warmup gate — capture suppressed below warmup, allowed at/above
+    sc4 = Scars(brain_dim=4, capacity=4, warmup=1000)
+    bs_w = np.array([3.0, 0.0, 0.0, 0.0])
+    high = np.array([0.95, 0.05])
+    captured_early = sc4.maybe_capture(bs_w, high, target_bit=1, round_=0)
+    captured_just_under = sc4.maybe_capture(bs_w, high, target_bit=1,
+                                            round_=999)
+    captured_at = sc4.maybe_capture(bs_w, high, target_bit=1, round_=1000)
+    REPORT.check("warmup: capture suppressed at round 0",
+                 not captured_early)
+    REPORT.check("warmup: capture suppressed at warmup-1",
+                 not captured_just_under)
+    REPORT.check("warmup: capture allowed at warmup",
+                 captured_at and len(sc4.vectors) == 1)
 
 
 # ── 5. project_off_scars math sanity ─────────────────────────────────
