@@ -1447,6 +1447,238 @@ class Proprioception:
 
 
 # ----------------------------------------------------------------------
+#  Wound — pain v5, the silencing
+# ----------------------------------------------------------------------
+#
+# Pain v5: when the creature is confidently wrong, it goes briefly
+# silent. Silent means the brain takes no gradient step for the next
+# few train_pairs. Organs continue to learn (Hebbian on observation,
+# supervised on brain_state); the brain's encode still runs (its
+# outputs still flow to organs); pain mood scalars still update. Only
+# the brain's WEIGHTS are paused.
+#
+# The wound is one integer (wound_remaining) that decrements per
+# train_pair. The substrate selection acts on is one scalar
+# (tenderness) in [0, 1] that determines how long a wound lasts. The
+# whole mechanism is a refractory period — biology's simplest pain.
+#
+# Why this survives v1..v4:
+#
+#   v1 (mood)          : no heritable substrate.
+#                        Wound has tenderness — heritable, mutates at
+#                        spawn, selection has something to act on.
+#
+#   v2 (replay)        : stale gradients dragged the brain backward.
+#                        Wound stores nothing. There is no buffer to
+#                        go stale; there is no gradient to replay.
+#
+#   v3 (scars)         : projection blocked the gradient signal.
+#                        Wound never touches the brain's geometry. All
+#                        brain_dim dimensions remain available, both
+#                        forward and backward, every step.
+#
+#   v4 (proprioception): pain perturbed every encode call even when
+#                        unused.
+#                        Wound is a single integer check. When
+#                        wound_remaining == 0 (or enabled=False), the
+#                        listen() loop is bit-identical to baseline.
+#                        No extra tensor enters the brain's forward
+#                        pass. Selection budget cost is one scalar
+#                        per spawn, not 16 dimensions.
+#
+# What the creature DOES under pain: a wounded bittern stutters. After
+# a sting-threshold event, the brain freezes for a few rounds.
+# Whatever pattern the brain was producing continues — same lateral
+# habits, same sensitivity vectors, but the brain's predictions stay
+# put. From the outside: repeated near-identical wrong outputs, then a
+# return to plasticity. Selection finds the tenderness value that
+# best trades "skip steps that would have over-corrected" against
+# "skip too many steps and stop learning."
+#
+# Failure modes worth watching for:
+#   - Tenderness drifts to 0. Selection finds no value in pausing.
+#     Informative negative: at this scale and corpus, MORE learning
+#     is always better.
+#   - Tenderness drifts to 1. Suggests stings are firing in damaging
+#     regimes; the brain prefers maximum freeze. Worth a deeper look.
+#   - Tenderness stable in (0, 1) and champion beats baseline. The
+#     first useful pain in this lineage.
+
+class Wound:
+    """Pain v5: a refractory period after confident wrongness.
+
+    One scalar (tenderness, heritable, in [0, 1]) determines how long
+    a wound silences the brain. One integer (wound_remaining, runtime,
+    per-life) counts down the current freeze. When the brain is
+    confidently wrong (sting = confidence × wrongness > threshold) and
+    not already wounded, a new wound is inflicted. While wounded, the
+    brain's gradient step is skipped (passed lr=0 in train_step).
+
+    Heritability: tenderness is the substrate selection acts on. It
+    is cloned and Gaussian-mutated at spawn time (in evolve.py's
+    spawn(), via clone_for_child) with a mutation magnitude that can
+    be larger than the brain-weight sigma — tenderness is one scalar
+    spanning a unit interval, so a per-spawn delta of order 0.05–0.10
+    is needed for selection to explore the range within reasonable
+    generation counts.
+
+    Felt-state: wound_remaining and the two counters (wounds_inflicted,
+    steps_silenced) reset on reset_emotional_state(). The tenderness
+    persists — it lives across generations like a brain weight.
+
+    Ablation: with enabled=False, is_wounded() always returns False
+    and maybe_inflict() is a no-op. The listen() loop's lr path is
+    identical to baseline. Tenderness still mutates at spawn (the
+    RNG draw is consistent with pain_embedding's pattern), but it is
+    never consulted.
+    """
+
+    DEFAULT_THRESHOLD = 0.6      # sting must exceed this to wound
+    DEFAULT_MAX_LEN = 8           # wound at tenderness=1 lasts 8 pairs
+    DEFAULT_TENDERNESS = 0.3      # gen-0 initial value
+    DEFAULT_MUTATION_SIGMA = 0.1  # per-spawn Gaussian, clipped to [0,1]
+
+    def __init__(self,
+                 tenderness=DEFAULT_TENDERNESS,
+                 threshold=DEFAULT_THRESHOLD,
+                 max_len=DEFAULT_MAX_LEN,
+                 mutation_sigma=DEFAULT_MUTATION_SIGMA):
+        self.tenderness = float(np.clip(tenderness, 0.0, 1.0))
+        self.threshold = float(threshold)
+        self.max_len = int(max_len)
+        self.mutation_sigma = float(mutation_sigma)
+        # Runtime state (per-life; not heritable)
+        self.wound_remaining = 0
+        # Diagnostics (per-life; reset at generation boundary)
+        self.wounds_inflicted = 0
+        self.steps_silenced = 0
+        # Master toggle for ablation
+        self.enabled = True
+
+    # ── Queries ──────────────────────────────────────────────────────
+
+    def is_wounded(self):
+        """True iff the brain should skip its next gradient step.
+
+        Returns False whenever enabled=False, regardless of
+        wound_remaining. This is what makes the disabled-mode
+        listen() loop bit-identical to baseline."""
+        return self.enabled and self.wound_remaining > 0
+
+    # ── Updates ──────────────────────────────────────────────────────
+
+    def maybe_inflict(self, brain_probs_pre, target_bit):
+        """If this pair's sting crossed threshold, start a wound.
+
+        Called once per train_pair, AFTER the (possibly zero-lr)
+        train_step. Uses PRE-update probs, consistent with how
+        PainfulMemory and Scars decide their captures.
+
+        With tenderness=0, ceil(0 * max_len) = 0 so no wound is
+        inflicted — the creature is immune. This is the costless-
+        when-evolved-to-zero case; it does not require enabled=False.
+
+        Returns True iff a wound was inflicted."""
+        if not self.enabled:
+            return False
+        confidence = float(np.max(brain_probs_pre))
+        wrongness = float(1.0 - brain_probs_pre[int(target_bit)])
+        sting = confidence * wrongness
+        if sting < self.threshold:
+            return False
+        duration = int(np.ceil(self.tenderness * self.max_len))
+        if duration < 1:
+            return False  # tenderness=0 → no wound, brain is immune
+        self.wound_remaining = duration
+        self.wounds_inflicted += 1
+        return True
+
+    def tick(self):
+        """Decrement wound_remaining by 1, capped at 0. Called once
+        per train_pair when is_wounded() was true for this iteration."""
+        if self.wound_remaining > 0:
+            self.wound_remaining -= 1
+            self.steps_silenced += 1
+
+    # ── Heritability + life cycle ────────────────────────────────────
+
+    def reset_for_life(self):
+        """Clear runtime state. Called from reset_emotional_state()
+        at generation boundaries. Tenderness, threshold, max_len, and
+        the toggle persist — they are heritable / configured."""
+        self.wound_remaining = 0
+        self.wounds_inflicted = 0
+        self.steps_silenced = 0
+
+    def clone_for_child(self, sigma=None, rng=None):
+        """Spawn-time inheritance.
+
+        Tenderness is the heritable scalar; it is Gaussian-mutated
+        with the per-spawn sigma (defaulting to self.mutation_sigma)
+        and clipped back to [0, 1]. Threshold, max_len, and the
+        toggle are inherited unchanged.
+
+        Note on RNG: this method always consumes one rng.normal()
+        draw, regardless of self.enabled. This mirrors the pattern
+        used for Brain.pain_embedding — mutation budget for an
+        unused parameter is a known, small, acceptable cost (one
+        scalar; selection-budget impact is negligible). The
+        alternative (conditional draw) would couple this class to
+        the master toggle in a way that makes the RNG state
+        depend on configuration, which is worse for reproducibility.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        s = float(sigma) if sigma is not None else self.mutation_sigma
+        noise = float(rng.normal(0, s))
+        mutated = float(np.clip(self.tenderness + noise, 0.0, 1.0))
+        child = Wound(tenderness=mutated,
+                      threshold=self.threshold,
+                      max_len=self.max_len,
+                      mutation_sigma=self.mutation_sigma)
+        child.enabled = bool(self.enabled)
+        return child
+
+    # ── Reporting ────────────────────────────────────────────────────
+
+    def report(self):
+        return {
+            'tenderness': float(self.tenderness),
+            'threshold': float(self.threshold),
+            'max_len': int(self.max_len),
+            'wound_remaining': int(self.wound_remaining),
+            'wounds_inflicted': int(self.wounds_inflicted),
+            'steps_silenced': int(self.steps_silenced),
+            'enabled': bool(self.enabled),
+        }
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def state_dict(self):
+        return {
+            'tenderness': float(self.tenderness),
+            'threshold': float(self.threshold),
+            'max_len': int(self.max_len),
+            'mutation_sigma': float(self.mutation_sigma),
+            'wound_remaining': int(self.wound_remaining),
+            'wounds_inflicted': int(self.wounds_inflicted),
+            'steps_silenced': int(self.steps_silenced),
+            'enabled': bool(self.enabled),
+        }
+
+    def load_state(self, sd):
+        self.tenderness = float(np.clip(sd['tenderness'], 0.0, 1.0))
+        self.threshold = float(sd['threshold'])
+        self.max_len = int(sd['max_len'])
+        self.mutation_sigma = float(sd.get(
+            'mutation_sigma', self.DEFAULT_MUTATION_SIGMA))
+        self.wound_remaining = int(sd.get('wound_remaining', 0))
+        self.wounds_inflicted = int(sd.get('wounds_inflicted', 0))
+        self.steps_silenced = int(sd.get('steps_silenced', 0))
+        self.enabled = bool(sd.get('enabled', True))
+
+
+# ----------------------------------------------------------------------
 #  Bittern — the creature
 # ----------------------------------------------------------------------
 
@@ -1485,6 +1717,13 @@ class Bittern:
         # the persistent, heritable substance is pain_embedding,
         # which lives in self.brain and is mutated/copied by spawn().
         self.proprioception = Proprioception()
+        # Wound (pain v5): the silencing. Tenderness is heritable
+        # (mutated at spawn via clone_for_child); the wound counter
+        # is per-life (cleared by reset_emotional_state). When
+        # wounded, listen()'s brain gradient step is skipped (lr=0)
+        # for that pair — the brain doesn't update, but encode and
+        # organ learning continue. See the Wound class docstring.
+        self.wound = Wound()
         self.round = 0
         self.recent_brain_losses = []
 
@@ -1621,6 +1860,25 @@ class Bittern:
             # Disquiet adds urgency to the brain's learning rate.
             eff_brain_lr = self.pain.effective_brain_lr(lr)
 
+            # ── Wound gate (pain v5) ──────────────────────────────
+            # If the brain is currently wounded, the gradient step is
+            # silenced for this pair: we pass lr=0 to train_step,
+            # which runs the full forward pass (returning the loss
+            # as usual) but every weight update becomes `param -= 0
+            # * grad` — a no-op. Everything else in this iteration
+            # continues normally: encode, scar/painful-memory capture,
+            # organ updates, pain mood scalars. Only the brain's
+            # weights are frozen.
+            #
+            # With wound.enabled=False, is_wounded() always returns
+            # False, so this branch never fires and eff_brain_lr is
+            # the unmodified pain-or-baseline value above. The
+            # listen() loop's behavior is bit-identical to the
+            # pre-v5 code in that case.
+            was_wounded = self.wound.is_wounded()
+            if was_wounded:
+                eff_brain_lr = 0.0
+
             loss = self.brain.train_step(prefix, target,
                                          lr=eff_brain_lr,
                                          scars=self.scars,
@@ -1668,6 +1926,23 @@ class Bittern:
                 self.organs.sensitivity_lr)
             self.organs.learn_from_brain(
                 bs, target, sensitivity_lr_override=eff_sens_lr)
+
+            # ── Wound update (pain v5) ────────────────────────────
+            # End of iteration. Two cases:
+            #   - was_wounded: the brain just skipped its gradient
+            #     step. Tick the wound counter down by 1. When it
+            #     reaches 0, the next iteration will learn normally.
+            #   - not was_wounded: the brain just took a gradient
+            #     step. If the pre-update probs were confidently
+            #     wrong (sting > threshold), set the wound counter
+            #     so the next few iterations skip their steps. The
+            #     painful step itself is NOT skipped — the brain
+            #     gets to learn from the first hit. The wound only
+            #     prevents pile-on on subsequent similar pairs.
+            if was_wounded:
+                self.wound.tick()
+            else:
+                self.wound.maybe_inflict(brain_probs_pre, target)
 
         if len(self.recent_brain_losses) > 200:
             self.recent_brain_losses = self.recent_brain_losses[-200:]
@@ -1810,7 +2085,15 @@ class Bittern:
         across generations (via clone_for_child at spawn time) and
         survive a parent's transition into the next generation.
         Resetting scars on a surviving parent would erase the very
-        substrate selection is supposed to be operating on."""
+        substrate selection is supposed to be operating on.
+
+        WOUND'S TENDERNESS is also NOT reset here. Tenderness is
+        heritable (mutated at spawn via clone_for_child), so for
+        the same reasons as scars: resetting it would erase the
+        substrate selection acts on. What IS reset is the wound's
+        per-life state: wound_remaining (so a parent doesn't enter
+        the next generation pre-wounded) and the per-life diagnostic
+        counters (wounds_inflicted, steps_silenced)."""
         self.battery = Battery()
         self.pain = Pain(brain_dim=self.brain.brain_dim)
         self.painful_memory = PainfulMemory()
@@ -1818,6 +2101,8 @@ class Bittern:
         # reset; only the transient per-call dict gets cleared.
         # (Brain.pain_embedding is untouched — it's heritable.)
         self.proprioception.reset_pain_for_call()
+        # Wound: clear per-life runtime state; tenderness persists.
+        self.wound.reset_for_life()
         # self.scars is intentionally untouched — see docstring.
         self.round = 0
         self.recent_brain_losses = []
@@ -1872,6 +2157,11 @@ class Bittern:
             # pain v4 — Brain.pain_embedding — is saved with the
             # brain blob above (as brain__pain_embedding).
             'proprioception': pr_dict,
+            # Wound (pain v5). All state lives in this small dict
+            # since the substrate is a single scalar (tenderness)
+            # plus a runtime counter. Tenderness is the heritable
+            # substance selection acts on.
+            'wound': self.wound.state_dict(),
         }
         with open(path + '.json', 'w') as f:
             json.dump(meta, f, indent=2)
@@ -1948,11 +2238,18 @@ class Bittern:
             bittern.proprioception.load_state(meta['proprioception'])
         # else: bittern.proprioception was already constructed fresh
 
+        # Wound — backwards compatible with pre-v5 saves. Pre-v5
+        # blobs have no 'wound' key; the freshly-constructed Wound
+        # (with default tenderness=0.3) stays.
+        if 'wound' in meta:
+            bittern.wound.load_state(meta['wound'])
+        # else: bittern.wound was already constructed fresh
+
         return bittern
 
 
 __all__ = ['Brain', 'Organs', 'Battery', 'Pain', 'PainfulMemory',
-           'Scars', 'Proprioception', 'Bittern',
+           'Scars', 'Proprioception', 'Wound', 'Bittern',
            'project_off_scars',
            'VOCAB_SIZE', 'DEFAULT_EMBED_DIM', 'DEFAULT_BRAIN_DIM',
            'DEFAULT_CONTEXT']

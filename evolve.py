@@ -99,7 +99,8 @@ BRAIN_PARAMS = ['embedding', 'W_q', 'W_k', 'W_v', 'W_o', 'W_out', 'b_out',
                 'pain_embedding']
 
 
-def spawn(parent, child_name, sigma=0.02, rng=None):
+def spawn(parent, child_name, sigma=0.02, rng=None,
+          wound_sigma=None):
     """Create a child from a parent.
 
     Brain weights are copied and mutated (Gaussian noise, scale sigma).
@@ -112,6 +113,14 @@ def spawn(parent, child_name, sigma=0.02, rng=None):
     a child of a 4-scar parent starts life with 4 dimensions of
     brain_state already carved out. This is the substrate
     selection is supposed to operate on.
+
+    Wound's TENDERNESS is HERITABLE. The child receives a copy of
+    the parent's tenderness with one Gaussian-mutation step, clipped
+    to [0, 1]. The mutation magnitude is wound_sigma (default: the
+    Wound class's own default, currently 0.1). This is larger than
+    the brain-weight sigma because tenderness is a single scalar on
+    a unit interval and needs a meaningful per-spawn delta to allow
+    selection to explore the range.
     """
     rng = rng or np.random.default_rng()
 
@@ -131,6 +140,13 @@ def spawn(parent, child_name, sigma=0.02, rng=None):
 
     # Inherit scars structurally. Deep-copy via clone_for_child.
     child.scars = parent.scars.clone_for_child()
+
+    # Inherit wound tenderness. clone_for_child handles the Gaussian
+    # mutation. When wound_sigma is None, the Wound class's own
+    # default is used. The RNG draw happens unconditionally (even
+    # when wound is disabled) — mirrors the pain_embedding pattern
+    # and keeps the RNG state independent of toggle configuration.
+    child.wound = parent.wound.clone_for_child(sigma=wound_sigma, rng=rng)
 
     return child
 
@@ -165,6 +181,18 @@ def _set_proprioception(c, enabled):
     mutated by spawn() (harmlessly, since it's unused) so a single
     seed produces an identical creature regardless of toggle."""
     c.proprioception.enabled = bool(enabled)
+
+
+def _set_wound(c, enabled):
+    """Helper: flip the wound (pain v5) master toggle on a creature.
+
+    With enabled=False, Wound.is_wounded() always returns False, so
+    the listen() loop never zeros out the brain lr — behavior is
+    bit-identical to the pre-v5 path. The tenderness parameter is
+    still mutated by spawn() (one scalar per spawn, harmless when
+    unused), so a single seed produces an identical creature
+    regardless of toggle."""
+    c.wound.enabled = bool(enabled)
 
 
 # ── Competitive habitat (one generation) ─────────────────────────────
@@ -281,7 +309,8 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
            names=None, champion_name='champion',
            pain_enabled=True, replay_enabled=True,
            scars_enabled=True, scar_warmup=None,
-           propio_enabled=True):
+           propio_enabled=True, wound_enabled=True,
+           wound_sigma=None):
     """Run the tournament.
 
     scar_warmup: if not None, override every creature's
@@ -294,6 +323,16 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
         term enters encode, no gradient flows to pain_embedding.
         The pain_embedding parameter is still mutated by spawn()
         regardless, but it's unused when the toggle is off.
+
+    wound_enabled: pain v5 (wound) master toggle. When False, the
+        brain never silences during listen() — bit-identical to
+        pre-v5 path. Tenderness is still mutated by spawn() (one
+        scalar, harmless when unused).
+
+    wound_sigma: per-spawn mutation magnitude for tenderness. If
+        None, the Wound class's own default is used (currently
+        0.1). Tenderness mutates more aggressively than brain
+        weights because it's a single scalar on a unit interval.
     """
     rng = np.random.default_rng(seed)
 
@@ -318,6 +357,11 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     else:
         print(f"  scars:          OFF (ablation)")
     print(f"  proprioception: {'ON' if propio_enabled else 'OFF (ablation)'}")
+    if wound_enabled:
+        ws = wound_sigma if wound_sigma is not None else 'default(0.1)'
+        print(f"  wound (v5):     ON  (tenderness σ={ws})")
+    else:
+        print(f"  wound (v5):     OFF (ablation)")
     print(f"{'='*65}")
 
     creatures = []
@@ -329,6 +373,7 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
         _set_replay(c, replay_enabled)
         _set_scars(c, scars_enabled)
         _set_proprioception(c, propio_enabled)
+        _set_wound(c, wound_enabled)
         _apply_warmup(c)
         creatures.append(c)
 
@@ -370,8 +415,17 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
             sc_str = (f"scars={sr['size']}/{sr['capacity']}"
                       + (f" max_cos={sr['max_pairwise_cos']:+.2f}"
                          if sr['size'] >= 2 else ""))
+            wr = c.wound.report()
+            # Show tenderness always (the heritable substrate); show
+            # wound activity only when the toggle is on.
+            if wound_enabled:
+                w_str = (f"tend={wr['tenderness']:.2f} "
+                         f"wounds={wr['wounds_inflicted']} "
+                         f"silenced={wr['steps_silenced']}")
+            else:
+                w_str = f"tend={wr['tenderness']:.2f}"
             print(f"    {marker} {rank+1}. {c.name:12s}  "
-                  f"CE={r['tf_ce']:.3f}  {sc_str}  ({pc_str})")
+                  f"CE={r['tf_ce']:.3f}  {sc_str}  {w_str}  ({pc_str})")
 
         # Champion babble
         champ = results[0]['creature']
@@ -385,6 +439,10 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
         # Stored as a (k, brain_dim) array so we can later compare
         # whether independent lineages converge on similar scars.
         champ_dirs = champ.scars.directions()
+        # Wound trajectory: tenderness is the heritable substrate
+        # selection acts on. Tracking it across generations is the
+        # primary readout of the v5 experiment.
+        wr = champ.wound.report()
         champion_history.append({
             'gen': gen,
             'name': champ.name,
@@ -393,6 +451,9 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
             'scars_size': champ.scars.report()['size'],
             'scars_directions': (champ_dirs.tolist()
                                   if champ_dirs is not None else []),
+            'tenderness': wr['tenderness'],
+            'wounds_inflicted': wr['wounds_inflicted'],
+            'steps_silenced': wr['steps_silenced'],
         })
 
         # Selection + reproduction (skip on last generation)
@@ -418,30 +479,41 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
                 # the next generation with the same scar buffer it
                 # ended this generation with.
                 parent_scars_before = len(parent.scars.vectors)
+                parent_tenderness_before = parent.wound.tenderness
                 parent.reset_emotional_state()
                 assert len(parent.scars.vectors) == parent_scars_before, (
                     "reset_emotional_state should not touch scars")
+                assert parent.wound.tenderness == parent_tenderness_before, (
+                    "reset_emotional_state should not touch wound.tenderness")
                 _set_pain(parent, pain_enabled)
                 _set_replay(parent, replay_enabled)
                 _set_scars(parent, scars_enabled)
                 _set_proprioception(parent, propio_enabled)
+                _set_wound(parent, wound_enabled)
                 _apply_warmup(parent)
                 next_gen.append(parent)
 
                 # One child per parent. spawn() copies the parent's
-                # scars deep into the child via clone_for_child.
+                # scars deep into the child via clone_for_child, and
+                # copies + mutates the parent's tenderness via
+                # Wound.clone_for_child.
                 child_name = (f"{next_label}_"
                               f"{name_pool[(i + pop_size//2) % len(name_pool)]}")
-                child = spawn(parent, child_name, sigma=sigma, rng=rng)
+                child = spawn(parent, child_name, sigma=sigma, rng=rng,
+                              wound_sigma=wound_sigma)
                 _set_pain(child, pain_enabled)
                 _set_replay(child, replay_enabled)
                 _set_scars(child, scars_enabled)
                 _set_proprioception(child, propio_enabled)
+                _set_wound(child, wound_enabled)
                 _apply_warmup(child)
                 next_gen.append(child)
                 inh = len(child.scars.vectors)
+                tnd_p = parent.wound.tenderness
+                tnd_c = child.wound.tenderness
                 print(f"    {parent.name} → {child.name} "
-                      f"(σ={sigma}, scars inherited={inh})")
+                      f"(σ={sigma}, scars inherited={inh}, "
+                      f"tend {tnd_p:.2f}→{tnd_c:.2f})")
 
             creatures = next_gen
 
@@ -452,12 +524,15 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     print(f"  replay:         {'ON' if replay_enabled else 'OFF (ablation)'}")
     print(f"  scars:          {'ON' if scars_enabled else 'OFF (ablation)'}")
     print(f"  proprioception: {'ON' if propio_enabled else 'OFF (ablation)'}")
+    print(f"  wound (v5):     {'ON' if wound_enabled else 'OFF (ablation)'}")
     print(f"{'='*65}")
     for h in champion_history:
         pc = h['per_class']
         pc_str = '  '.join(f"{cls}={ce:.3f}" for cls, ce in sorted(pc.items()))
+        w_str = (f"tend={h['tenderness']:.2f} "
+                 f"wounds={h['wounds_inflicted']}")
         print(f"  gen {h['gen']:2d}  {h['name']:12s}  CE={h['tf_ce']:.3f}  "
-              f"scars={h['scars_size']}  ({pc_str})")
+              f"scars={h['scars_size']}  {w_str}  ({pc_str})")
 
     # Final champion full probe
     final_champ = results[0]['creature']
@@ -466,6 +541,11 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
                  label=f"CHAMPION {final_champ.name}")
     # Final scar report
     print(f"\n  final champion scars: {final_champ.scars.report()}")
+    # Final wound report — tenderness is the heritable trait that
+    # selection has been acting on. wounds_inflicted / steps_silenced
+    # describe the FINAL generation only (per-life counters reset at
+    # generation boundary). Tenderness is the cross-generation story.
+    print(f"  final champion wound: {final_champ.wound.report()}")
 
     # Pain v4 probe: compare calm vs sustained-pain babble on the
     # champion. If proprioception is off, this just produces two
@@ -492,6 +572,7 @@ def evolve(pop_size=8, generations=10, rounds_per_gen=5000,
     _set_replay(loner, replay_enabled)
     _set_scars(loner, scars_enabled)
     _set_proprioception(loner, propio_enabled)
+    _set_wound(loner, wound_enabled)
     _apply_warmup(loner)
     for r in range(total_rounds):
         item = train_corpus[r % len(train_corpus)]
@@ -539,6 +620,12 @@ def main():
     p.add_argument('--no-proprioception', action='store_true',
                    help='disable the pain v4 (proprioception) channel '
                         '(ablation control)')
+    p.add_argument('--no-wound', action='store_true',
+                   help='disable the pain v5 (wound) silencing '
+                        '(ablation control)')
+    p.add_argument('--wound-sigma', type=float, default=None,
+                   help='per-spawn mutation magnitude for tenderness '
+                        '(default: Wound class default, 0.1)')
     args = p.parse_args()
 
     name_list = args.names.split(',') if args.names else None
@@ -551,7 +638,9 @@ def main():
            replay_enabled=not args.no_replay,
            scars_enabled=not args.no_scars,
            scar_warmup=args.scar_warmup,
-           propio_enabled=not args.no_proprioception)
+           propio_enabled=not args.no_proprioception,
+           wound_enabled=not args.no_wound,
+           wound_sigma=args.wound_sigma)
 
 
 if __name__ == '__main__':
